@@ -123,8 +123,22 @@ export async function waitJson(url, timeoutMs = 30000) {
 export class Cdp {
   constructor(ws) { this.ws = ws; this.id = 0; this.pend = new Map(); }
 
+  // CDP 走 WebSocket。Node 22+ 内置全局 WebSocket；老版本回退到 ws 包（若装了）
+  static async resolveWebSocket() {
+    if (typeof WebSocket !== "undefined") return WebSocket;
+    try {
+      const m = await import("ws");
+      if (m?.default || m?.WebSocket) return m.default || m.WebSocket;
+    } catch {}
+    throw new Error(
+      "当前 Node 没有 WebSocket（Node 22+ 才内置）。请升级 Node，或在 winapp 下执行 npm i ws。\n" +
+      "当前版本：" + process.version
+    );
+  }
+
   static async attach(wsUrl) {
-    const ws = new WebSocket(wsUrl);
+    const WS = await Cdp.resolveWebSocket();
+    const ws = new WS(wsUrl);
     await new Promise((res, rej) => { ws.onopen = res; ws.onerror = rej; });
     const c = new Cdp(ws);
     ws.onmessage = (e) => {
@@ -155,6 +169,7 @@ export async function launchAndAttach({ port, url, profilePrefix, extraArgs = []
   const proc = spawn(browser, [
     "--headless=new", "--disable-gpu", "--no-first-run", "--no-default-browser-check",
     "--disable-dev-shm-usage",              // CI 容器 /dev/shm 小，必须加
+    "--no-sandbox",                         // CI 容器（root）下必需
     "--disable-web-security", "--allow-running-insecure-content",
     "--remote-debugging-port=" + port,
     "--user-data-dir=" + profile,
@@ -162,14 +177,26 @@ export async function launchAndAttach({ port, url, profilePrefix, extraArgs = []
     url,
   ], { stdio: "ignore" });
 
-  await waitJson(`http://127.0.0.1:${port}/json/version`);
+  let exited = null;
+  proc.on("exit", (code) => { exited = code; });
+
+  try {
+    await waitJson(`http://127.0.0.1:${port}/json/version`, 30000);
+  } catch (e) {
+    throw new Error(
+      `浏览器未能启动 CDP（${browser}）。退出码=${exited}。\n` +
+      `原始错误：${e.message}\n` +
+      `提示：容器环境通常需要 --no-sandbox；也确认浏览器可执行且未被策略阻止。`
+    );
+  }
+
   let page = null;
   for (let i = 0; i < 40 && !page; i++) {
     const list = await waitJson(`http://127.0.0.1:${port}/json/list`).catch(() => []);
     page = list.find((x) => x.type === "page" && x.url.includes("index.html"));
     if (!page) await sleep(400);
   }
-  if (!page) throw new Error("未找到页面目标");
+  if (!page) throw new Error("未找到页面目标（浏览器已起但没打开目标页）");
 
   const cdp = await Cdp.attach(page.webSocketDebuggerUrl);
   await cdp.send("Runtime.enable");

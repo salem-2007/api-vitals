@@ -22,7 +22,7 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: "20"
+          node-version: "22"   # 22+ 才内置全局 WebSocket（CDP 需要）
 
       - name: 跑引擎单测
         working-directory: winapp
@@ -38,7 +38,7 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: "20"
+          node-version: "22"   # 22+ 才内置全局 WebSocket（CDP 需要）
 
       # ubuntu-latest 已预装 Google Chrome；不去 apt 装 chromium（那是 snap 假包，会失败）
       - name: 定位浏览器
@@ -72,7 +72,7 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: "20"
+          node-version: "22"   # 22+ 才内置全局 WebSocket（CDP 需要）
 
       # ubuntu-latest 已预装 Google Chrome；不去 apt 装 chromium（那是 snap 假包，会失败）
       - name: 定位浏览器
