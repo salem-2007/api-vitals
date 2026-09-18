@@ -1,81 +1,25 @@
-// e2e-ui.mjs — 端到端：headless Edge(CDP) 驱动真实 UI 跑完整检测流程
-// 前置：同目录 mock.mjs；WSL 内 serve wwwroot (默认 18099)
+// e2e-ui.mjs — 端到端：headless 浏览器(CDP) 驱动真实 UI 跑完整检测流程
+// 自带静态服务与 mock，无需手工起 http.server
 // 用法：node test/e2e-ui.mjs
-import { spawn } from "node:child_process";
 import { startMock } from "./mock.mjs";
+import {
+  startStatic, launchAndAttach, waitLoaded, killBrowser, closeServer, makeAssert, sleep, log,
+} from "./harness.mjs";
 
-const EDGE = "/mnt/c/Program Files (x86)/Microsoft/Edge/Application/msedge.exe";
-const APP = "http://127.0.0.1:18099/index.html";
-const MOCK = "http://127.0.0.1:18990/v1";
+const PORT = Number(process.env.APP_PORT || 18099);
+const MOCK_PORT = Number(process.env.MOCK_PORT || 18990);
+const APP = `http://127.0.0.1:${PORT}/index.html`;
+const MOCK = `http://127.0.0.1:${MOCK_PORT}/v1`;
 const CDP = 9400 + Math.floor(Math.random() * 400); // 随机端口：避免连上残留实例
+const PROFILE_PREFIX = "edge-e2e";
 
-const log = (...a) => console.log(...a);
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+// ---------- 起 mock + 静态服务 ----------
+const mock = await startMock(MOCK_PORT);
+const server = await startStatic(PORT);
 
-// 只清理由本 harness 启动的 Edge（按 profile 前缀匹配），不碰用户自己的浏览器
-async function killOurEdge() {
-  const ps = [
-    "$ErrorActionPreference='SilentlyContinue';",
-    "Get-CimInstance Win32_Process -Filter \"Name='msedge.exe'\" |",
-    "Where-Object { $_.CommandLine -like '*edge-e2e-*' } |",
-    "ForEach-Object { Stop-Process -Id $_.ProcessId -Force }",
-  ].join(" ");
-  const { execFile } = await import("node:child_process");
-  await new Promise((res) => {
-    execFile("/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe", ["-NoProfile", "-Command", ps], () => res());
-  });
-}
+// ---------- 起 headless 浏览器 ----------
+const { cdp, proc } = await launchAndAttach({ port: CDP, url: APP, profilePrefix: PROFILE_PREFIX });
 
-async function waitJson(url, timeoutMs = 30000) {
-  const t0 = Date.now();
-  for (;;) {
-    try {
-      const r = await fetch(url);
-      if (r.ok) return await r.json();
-    } catch {}
-    if (Date.now() - t0 > timeoutMs) throw new Error("CDP 未就绪: " + url);
-    await sleep(400);
-  }
-}
-
-class Cdp {
-  constructor(ws) { this.ws = ws; this.id = 0; this.pend = new Map(); }
-  static async attach(wsUrl) {
-    const ws = new WebSocket(wsUrl);
-    await new Promise((res, rej) => { ws.onopen = res; ws.onerror = rej; });
-    const c = new Cdp(ws);
-    ws.onmessage = (e) => {
-      const m = JSON.parse(e.data);
-      if (m.id && c.pend.has(m.id)) { c.pend.get(m.id)(m); c.pend.delete(m.id); }
-    };
-    return c;
-  }
-  send(method, params = {}) {
-    const id = ++this.id;
-    return new Promise((res) => { this.pend.set(id, res); this.ws.send(JSON.stringify({ id, method, params })); });
-  }
-  async ev(expr) {
-    const r = await this.send("Runtime.evaluate", { expression: expr, awaitPromise: true, returnByValue: true });
-    if (r.result?.exceptionDetails) throw new Error("JS 异常: " + JSON.stringify(r.result.exceptionDetails.exception?.description || r.result.exceptionDetails));
-    return r.result?.result?.value;
-  }
-}
-
-// ---------- 起 mock ----------
-await killOurEdge(); // 清掉上一轮残留（否则会连到旧实例，拿不到正确的启动参数）
-const mock = await startMock(18990);
-
-// ---------- 起 headless Edge ----------
-const profile = "C:\\Users\\Legion\\AppData\\Local\\Temp\\edge-e2e-" + Date.now();
-const edge = spawn(EDGE, [
-  "--headless=new", "--disable-gpu", "--no-first-run", "--no-default-browser-check",
-  "--disable-web-security", "--allow-running-insecure-content",
-  "--remote-debugging-port=" + CDP,
-  "--user-data-dir=" + profile,
-  APP,
-], { stdio: "ignore" });
-
-let cdp = null;
 let pass = 0, fail = 0;
 const t = (name, ok, info = "") => {
   if (ok) { pass++; log("  PASS  " + name); }
@@ -83,22 +27,8 @@ const t = (name, ok, info = "") => {
 };
 
 try {
-  await waitJson(`http://127.0.0.1:${CDP}/json/version`);
-  const targets = await waitJson(`http://127.0.0.1:${CDP}/json/list`);
-  const page = targets.find((x) => x.type === "page" && x.url.includes("index.html"));
-  if (!page) throw new Error("未找到页面目标");
-  cdp = await Cdp.attach(page.webSocketDebuggerUrl);
-  await cdp.send("Runtime.enable");
-  await cdp.send("Page.enable");
-
   // 等页面真正导航到 app 源（headless 新实例初始可能是 about:blank，读 localStorage 会 SecurityError）
-  let originOk = false;
-  for (let i = 0; i < 30; i++) {
-    const st = await cdp.ev(`location.origin + "|" + document.readyState`).catch(() => "|loading");
-    if (String(st).startsWith("http://127.0.0.1:18099") && String(st).endsWith("complete")) { originOk = true; break; }
-    if (i === 3) { await cdp.send("Page.navigate", { url: APP }).catch(() => {}); }
-    await sleep(500);
-  }
+  const originOk = await waitLoaded(cdp, `http://127.0.0.1:${PORT}`, { appUrl: APP });
   if (!originOk) throw new Error("页面未导航到 app 源");
   log("== 已连上页面 ==");
 
@@ -329,10 +259,10 @@ try {
   fail++;
   log("  FAIL  端到端异常: " + e.message);
 } finally {
-  try { edge.kill("SIGKILL"); } catch {}
-  await killOurEdge();
+  await killBrowser(proc, PROFILE_PREFIX);
+  closeServer(server);
   try { mock.close(); } catch {}
-  if (cdp) { try { cdp.ws.close(); } catch {} }
+  try { cdp.ws.close(); } catch {}
 }
 
 log("");

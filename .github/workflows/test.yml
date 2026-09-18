@@ -1,0 +1,136 @@
+name: test
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "winapp/wwwroot/**"
+      - "winapp/test/**"
+      - "winapp/ApiHealth.csproj"
+      - ".github/workflows/**"
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  # 引擎层单测：纯 Node，无浏览器依赖，最快的反馈回路
+  engine:
+    name: 引擎单元测试
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: 跑引擎单测
+        working-directory: winapp
+        run: node test/test-engine.mjs
+
+  # 端到端：headless Chromium + CDP 驱动真实 UI
+  # 测试脚本自带静态服务与 mock，无需额外起服务
+  e2e:
+    name: UI 端到端
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      # ubuntu-latest 已预装 Google Chrome；不去 apt 装 chromium（那是 snap 假包，会失败）
+      - name: 定位浏览器
+        id: browser
+        run: |
+          for p in /usr/bin/google-chrome /usr/bin/google-chrome-stable /opt/google/chrome/chrome; do
+            if [ -x "$p" ]; then echo "path=$p" >> "$GITHUB_OUTPUT"; echo "使用 $p"; exit 0; fi
+          done
+          echo "未找到浏览器"; ls -la /usr/bin | grep -i chrom || true; exit 1
+
+      - name: 跑端到端
+        working-directory: winapp
+        env:
+          BROWSER_PATH: ${{ steps.browser.outputs.path }}
+        run: node test/e2e-ui.mjs
+
+      - name: 失败时上传截图
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-failure-screenshots
+          path: /tmp/*.png
+          if-no-files-found: ignore
+
+  # 样式审计：字体是否真的生效、对比度、浮层定位
+  audit:
+    name: 样式审计
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      # ubuntu-latest 已预装 Google Chrome；不去 apt 装 chromium（那是 snap 假包，会失败）
+      - name: 定位浏览器
+        id: browser
+        run: |
+          for p in /usr/bin/google-chrome /usr/bin/google-chrome-stable /opt/google/chrome/chrome; do
+            if [ -x "$p" ]; then echo "path=$p" >> "$GITHUB_OUTPUT"; echo "使用 $p"; exit 0; fi
+          done
+          echo "未找到浏览器"; ls -la /usr/bin | grep -i chrom || true; exit 1
+
+      - name: 跑样式审计
+        working-directory: winapp
+        env:
+          BROWSER_PATH: ${{ steps.browser.outputs.path }}
+        run: node test/audit.mjs
+
+      - name: 上传审计截图
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: audit-screenshots
+          path: /tmp/audit-*.png
+          if-no-files-found: ignore
+
+  # 桌面壳构建：验证 C# 侧能编译通过（Windows runner）
+  build-win:
+    name: 构建 Windows 客户端
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "10.0.x"
+
+      - name: 发布单文件 exe
+        working-directory: winapp
+        run: |
+          dotnet publish -c Release -r win-x64 --self-contained false `
+            -p:PublishSingleFile=true `
+            -p:IncludeNativeLibrariesForSelfExtract=true `
+            -o dist
+
+      - name: 检查产物
+        working-directory: winapp
+        shell: pwsh
+        run: |
+          $exe = Get-Item "dist/ApiHealth.exe"
+          if ($exe.Length -lt 1MB) { throw "exe 体积异常：$($exe.Length) bytes" }
+          "exe 大小：{0:N2} MB" -f ($exe.Length / 1MB)
+          # 校验 exe 里带上了自定义图标
+          Add-Type -AssemblyName System.Drawing
+          $ico = [System.Drawing.Icon]::ExtractAssociatedIcon($exe.FullName)
+          if (-not $ico) { throw "exe 未嵌入图标" }
+          "图标：$($ico.Width)x$($ico.Height)"
+
+      - name: 上传 exe
+        uses: actions/upload-artifact@v4
+        with:
+          name: ApiHealth-exe
+          path: winapp/dist/ApiHealth.exe

@@ -1,84 +1,38 @@
-// shot.mjs — 视觉验证：跑一次真实检测后，分别截取深色/浅色主题
-// 用法：node test/shot.mjs  →  输出 /tmp/shot-dark.png, /tmp/shot-light.png, /tmp/shot-config-light.png
-import { spawn, execFile } from "node:child_process";
-import { writeFileSync } from "node:fs";
+// shot.mjs — 视觉验证：跑一次真实检测后，截取深/浅主题与端点编辑弹窗
+// 自带静态服务与 mock，跨平台（WSL / Linux CI）
+// 用法：node test/shot.mjs [输出目录]  默认 /tmp
+import { writeFileSync, mkdirSync } from "node:fs";
+import { join } from "node:path";
 import { startMock } from "./mock.mjs";
+import {
+  startStatic, launchAndAttach, waitLoaded, killBrowser, closeServer, sleep, log,
+} from "./harness.mjs";
 
-const EDGE = "/mnt/c/Program Files (x86)/Microsoft/Edge/Application/msedge.exe";
-const APP = "http://127.0.0.1:18099/index.html";
+const PORT = Number(process.env.APP_PORT || 18099);
+const MOCK_PORT = Number(process.env.MOCK_PORT || 18990);
+const OUT = process.argv[2] || process.env.SHOT_DIR || "/tmp";
+const APP = `http://127.0.0.1:${PORT}/index.html`;
 const CDP = 9800 + Math.floor(Math.random() * 150);
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-const log = (...a) => console.log(...a);
+const PROFILE_PREFIX = "edge-shot";
 
-async function killOurEdge() {
-  const ps = "$ErrorActionPreference='SilentlyContinue'; Get-CimInstance Win32_Process -Filter \"Name='msedge.exe'\" | Where-Object { $_.CommandLine -like '*edge-shot-*' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force }";
-  await new Promise((res) => {
-    execFile("/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe", ["-NoProfile", "-Command", ps], () => res());
-  });
-}
+mkdirSync(OUT, { recursive: true });
 
-async function waitJson(url, t = 25000) {
-  const t0 = Date.now();
-  for (;;) {
-    try { const r = await fetch(url); if (r.ok) return await r.json(); } catch {}
-    if (Date.now() - t0 > t) throw new Error("CDP 未就绪");
-    await sleep(400);
-  }
-}
+const mock = await startMock(MOCK_PORT);
+const server = await startStatic(PORT);
+const { cdp, proc } = await launchAndAttach({
+  port: CDP, url: APP, profilePrefix: PROFILE_PREFIX, extraArgs: ["--window-size=1440,900"],
+});
 
-class Cdp {
-  constructor(ws) { this.ws = ws; this.id = 0; this.pend = new Map(); }
-  static async attach(u) {
-    const ws = new WebSocket(u);
-    await new Promise((r, j) => { ws.onopen = r; ws.onerror = j; });
-    const c = new Cdp(ws);
-    ws.onmessage = (e) => {
-      const m = JSON.parse(e.data);
-      if (m.id && c.pend.has(m.id)) { c.pend.get(m.id)(m); c.pend.delete(m.id); }
-    };
-    return c;
-  }
-  send(m, p = {}) { const id = ++this.id; return new Promise((r) => { this.pend.set(id, r); this.ws.send(JSON.stringify({ id, method: m, params: p })); }); }
-  async ev(x) {
-    const r = await this.send("Runtime.evaluate", { expression: x, awaitPromise: true, returnByValue: true });
-    if (r.result?.exceptionDetails) throw new Error(JSON.stringify(r.result.exceptionDetails.text || r.result.exceptionDetails));
-    return r.result?.result?.value;
-  }
-  async shot(path) {
-    const r = await this.send("Page.captureScreenshot", { format: "png" });
-    if (!r.result?.data) throw new Error("截图失败");
-    writeFileSync(path, Buffer.from(r.result.data, "base64"));
-    log("  已保存 " + path);
-  }
-}
+cdp.shot = async function (path) {
+  const r = await this.send("Page.captureScreenshot", { format: "png" });
+  if (!r.result?.data) throw new Error("截图失败");
+  writeFileSync(path, Buffer.from(r.result.data, "base64"));
+  log("  已保存 " + path);
+};
 
-await killOurEdge();
-const mock = await startMock(18990);
-
-const profile = "C:\\Users\\Legion\\AppData\\Local\\Temp\\edge-shot-" + Date.now();
-const edge = spawn(EDGE, [
-  "--headless=new", "--disable-gpu", "--no-first-run", "--no-default-browser-check",
-  "--disable-web-security", "--allow-running-insecure-content",
-  "--window-size=1440,900",
-  "--remote-debugging-port=" + CDP,
-  "--user-data-dir=" + profile,
-  APP,
-], { stdio: "ignore" });
-
-let cdp = null;
 try {
-  await waitJson(`http://127.0.0.1:${CDP}/json/version`);
-  const tgt = (await waitJson(`http://127.0.0.1:${CDP}/json/list`)).find((x) => x.url.includes("index.html"));
-  cdp = await Cdp.attach(tgt.webSocketDebuggerUrl);
-  await cdp.send("Runtime.enable");
-  await cdp.send("Page.enable");
-
-  for (let i = 0; i < 30; i++) {
-    const st = await cdp.ev(`location.origin + "|" + document.readyState`).catch(() => "|loading");
-    if (String(st).startsWith("http://127.0.0.1:18099") && String(st).endsWith("complete")) break;
-    if (i === 3) await cdp.send("Page.navigate", { url: APP }).catch(() => {});
-    await sleep(500);
-  }
+  const ok = await waitLoaded(cdp, `http://127.0.0.1:${PORT}`, { appUrl: APP });
+  if (!ok) throw new Error("页面未导航到 app 源");
 
   // 造点真实数据：两个端点 + 一次完整检测
   const MOCK = "http://127.0.0.1:18990/v1";
@@ -117,22 +71,22 @@ try {
   // 深色仪表盘
   await cdp.ev(`AH.setTheme('dark'); "ok"`);
   await sleep(1200);
-  await cdp.shot("/tmp/shot-dark.png");
+  await cdp.shot(join(OUT, "shot-dark.png"));
 
   // 浅色仪表盘
   await cdp.ev(`AH.setTheme('light'); "ok"`);
   await sleep(1400);
-  await cdp.shot("/tmp/shot-light.png");
+  await cdp.shot(join(OUT, "shot-light.png"));
 
   // 浅色配置页
   await cdp.ev(`document.querySelector('.tabs button[data-tab="config"]').click(); "ok"`);
   await sleep(1000);
-  await cdp.shot("/tmp/shot-config-light.png");
+  await cdp.shot(join(OUT, "shot-config-light.png"));
 
   // 回到深色 + 记录页（验证表格圆角容器）
   await cdp.ev(`AH.setTheme('dark'); document.querySelector('.tabs button[data-tab="records"]').click(); "ok"`);
   await sleep(1200);
-  await cdp.shot("/tmp/shot-records-dark.png");
+  await cdp.shot(join(OUT, "shot-records-dark.png"));
 
   // 端点编辑弹窗（含「获取模型」按钮与模型列表）
   await cdp.ev(`(() => {
@@ -141,7 +95,7 @@ try {
     return "opened";
   })()`);
   await sleep(1000);
-  await cdp.shot("/tmp/shot-endpoint-editor.png");
+  await cdp.shot(join(OUT, "shot-endpoint-editor.png"));
   await cdp.ev(`(document.querySelector('.modal-actions .btn')?.click(), "closed")`);
 
   // 纯客户端截图（不截浏览器视口外的空白）
@@ -150,8 +104,8 @@ try {
 } catch (e) {
   log("FAIL " + e.message);
 } finally {
-  try { edge.kill("SIGKILL"); } catch {}
-  await killOurEdge();
+  await killBrowser(proc, PROFILE_PREFIX);
+  closeServer(server);
   try { mock.close(); } catch {}
-  if (cdp) { try { cdp.ws.close(); } catch {} }
+  try { cdp.ws.close(); } catch {}
 }

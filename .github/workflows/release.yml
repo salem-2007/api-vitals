@@ -1,0 +1,88 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "要发布的 tag（例如 v0.1.0）"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: 构建并发布
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "10.0.x"
+
+      - name: 解析版本号
+        id: ver
+        shell: pwsh
+        run: |
+          $tag = if ("${{ github.event.inputs.tag }}") { "${{ github.event.inputs.tag }}" } else { "${{ github.ref_name }}" }
+          $num = $tag -replace '^v', ''
+          "tag=$tag"   >> $env:GITHUB_OUTPUT
+          "num=$num"   >> $env:GITHUB_OUTPUT
+
+      - name: 发布单文件 exe
+        working-directory: winapp
+        run: |
+          dotnet publish -c Release -r win-x64 --self-contained false `
+            -p:PublishSingleFile=true `
+            -p:IncludeNativeLibrariesForSelfExtract=true `
+            -p:Version=${{ steps.ver.outputs.num }} `
+            -o dist
+
+      - name: 校验产物
+        working-directory: winapp
+        shell: pwsh
+        run: |
+          $exe = Get-Item "dist/ApiHealth.exe"
+          if ($exe.Length -lt 1MB) { throw "exe 体积异常：$($exe.Length) bytes" }
+          $sha = (Get-FileHash $exe.FullName -Algorithm SHA256).Hash
+          "ApiHealth.exe  $([math]::Round($exe.Length/1MB,2)) MB  SHA256=$sha"
+          "$sha  ApiHealth.exe" | Out-File -Encoding ascii dist/SHA256SUMS.txt
+
+      - name: 创建 Release 并附上 exe
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.ver.outputs.tag }}
+          name: ${{ steps.ver.outputs.tag }}
+          generate_release_notes: true
+          body: |
+            ## 下载
+
+            - **ApiHealth.exe** — Windows 单文件客户端，需要 .NET 10 桌面运行时
+              （未安装可先装 [.NET Desktop Runtime 10](https://dotnet.microsoft.com/download/dotnet/10.0)）
+
+            双击运行即可，无需解压。前端资源（含字体与图标）已内嵌。
+
+            ## 校验
+
+            见附件 `SHA256SUMS.txt`。
+
+            ```powershell
+            Get-FileHash .\ApiHealth.exe -Algorithm SHA256
+            ```
+
+            ## 首次使用
+
+            1. 左侧「+ 添加端点」或「批量导入」
+            2. 填 BaseURL 与 API Key（剪贴板里有连接信息会自动提示填入）
+            3. 点「获取模型」，勾选要测的模型
+            4. 「快速检测」跑一遍；需要并发压测就打开「并发」开关
+            5. 「记录」页看明细，可导出报告表格
+          files: |
+            winapp/dist/ApiHealth.exe
+            winapp/dist/SHA256SUMS.txt
+          draft: false
+          prerelease: ${{ contains(steps.ver.outputs.tag, '-') }}

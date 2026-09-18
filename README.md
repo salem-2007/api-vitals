@@ -110,16 +110,16 @@ bash build.sh          # 产物：winapp/dist/ApiHealth.exe
 cd winapp
 
 node test/test-engine.mjs    # 引擎单元测试（四类协议 × 各检测项）
-node test/e2e-ui.mjs         # 端到端（headless Edge + CDP 驱动真实 UI）
+node test/e2e-ui.mjs         # 端到端（headless 浏览器 + CDP 驱动真实 UI）
 node test/audit.mjs          # 计算样式审计（字体是否生效、对比度、浮层定位）
 node test/shot.mjs           # 生成深浅主题截图
 ```
 
-端到端测试需要先在 `winapp/wwwroot` 起一个静态服务：
+测试脚本**自带静态服务与 mock**，不需要手工起服务。浏览器自动探测
+（WSL 找 Windows 侧 Edge/Chrome，Linux 找 chrome/chromium），也可用 `BROWSER_PATH` 指定。
 
-```bash
-cd winapp/wwwroot && python3 -m http.server 18099 --bind 127.0.0.1
-```
+CI（`.github/workflows/test.yml`）在每次推送时跑：引擎单测、UI 端到端、样式审计，
+以及 Windows runner 上的客户端构建校验。
 
 ## 打包说明
 

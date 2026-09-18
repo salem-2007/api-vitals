@@ -1,64 +1,32 @@
-// audit.mjs — 用 CDP 读关键元素的计算样式（验证白底/字体/对比度），并截取顶部区域
-import { spawn, execFile } from "node:child_process";
+// audit.mjs — 读关键元素的计算样式（字体是否生效 / 对比度 / 浮层定位），并裁局部截图
+// 自带静态服务，跨平台（WSL / Linux CI）
+// 用法：node test/audit.mjs
 import { writeFileSync } from "node:fs";
+import {
+  startStatic, launchAndAttach, waitLoaded, killBrowser, closeServer, sleep, log,
+} from "./harness.mjs";
 
-const EDGE = "/mnt/c/Program Files (x86)/Microsoft/Edge/Application/msedge.exe";
-const APP = "http://127.0.0.1:18099/index.html";
+const PORT = Number(process.env.APP_PORT || 18099);
+const APP = `http://127.0.0.1:${PORT}/index.html`;
 const CDP = 9700 + Math.floor(Math.random() * 200);
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const PROFILE_PREFIX = "edge-audit";
 
-const profile = "C:\\\\Users\\\\Legion\\\\AppData\\\\Local\\\\Temp\\\\edge-audit-" + Date.now();
-const edge = spawn(EDGE, [
-  "--headless=new", "--disable-gpu", "--no-first-run", "--no-default-browser-check",
-  "--window-size=1440,900", "--remote-debugging-port=" + CDP,
-  "--user-data-dir=" + profile, APP,
-], { stdio: "ignore" });
+const server = await startStatic(PORT);
+const { cdp, proc } = await launchAndAttach({
+  port: CDP, url: APP, profilePrefix: PROFILE_PREFIX, extraArgs: ["--window-size=1440,900"],
+});
 
-async function waitJson(url, t = 25000) {
-  const t0 = Date.now();
-  for (;;) {
-    try { const r = await fetch(url); if (r.ok) return await r.json(); } catch {}
-    if (Date.now() - t0 > t) throw new Error("CDP 未就绪");
-    await sleep(400);
-  }
-}
-class Cdp {
-  constructor(ws) { this.ws = ws; this.id = 0; this.pend = new Map(); }
-  static async attach(u) {
-    const ws = new WebSocket(u);
-    await new Promise((r, j) => { ws.onopen = r; ws.onerror = j; });
-    const c = new Cdp(ws);
-    ws.onmessage = (e) => { const m = JSON.parse(e.data); if (m.id && c.pend.has(m.id)) { c.pend.get(m.id)(m); c.pend.delete(m.id); } };
-    return c;
-  }
-  send(m, p = {}) { const id = ++this.id; return new Promise((r) => { this.pend.set(id, r); this.ws.send(JSON.stringify({ id, method: m, params: p })); }); }
-  async ev(x) {
-    const r = await this.send("Runtime.evaluate", { expression: x, awaitPromise: true, returnByValue: true });
-    if (r.result?.exceptionDetails) throw new Error(JSON.stringify(r.result.exceptionDetails.text || r.result.exceptionDetails));
-    return r.result?.result?.value;
-  }
-  async shot(path, clip) {
-    const p = { format: "png" };
-    if (clip) p.clip = { ...clip, scale: 1 };
-    const r = await this.send("Page.captureScreenshot", p);
-    writeFileSync(path, Buffer.from(r.result.data, "base64"));
-    console.log("  shot ->", path);
-  }
-}
+cdp.shot = async function (path, clip) {
+  const p = { format: "png" };
+  if (clip) p.clip = { ...clip, scale: 1 };
+  const r = await this.send("Page.captureScreenshot", p);
+  writeFileSync(path, Buffer.from(r.result.data, "base64"));
+  log("  shot ->", path);
+};
 
-let cdp = null;
 try {
-  await waitJson(`http://127.0.0.1:${CDP}/json/version`);
-  const tgt = (await waitJson(`http://127.0.0.1:${CDP}/json/list`)).find((x) => x.url.includes("index.html"));
-  cdp = await Cdp.attach(tgt.webSocketDebuggerUrl);
-  await cdp.send("Runtime.enable");
-  await cdp.send("Page.enable");
-  for (let i = 0; i < 30; i++) {
-    const st = await cdp.ev(`location.origin + "|" + document.readyState`).catch(() => "|loading");
-    if (String(st).startsWith("http://127.0.0.1:18099") && String(st).endsWith("complete")) break;
-    if (i === 3) await cdp.send("Page.navigate", { url: APP }).catch(() => {});
-    await sleep(500);
-  }
+  const ok = await waitLoaded(cdp, `http://127.0.0.1:${PORT}`, { appUrl: APP });
+  if (!ok) throw new Error("页面未导航到 app 源");
   // 等字体加载完（font-display: swap）
   await cdp.ev(`document.fonts.ready.then(() => true)`);
   await sleep(1200);
@@ -135,9 +103,7 @@ try {
 } catch (e) {
   console.log("FAIL " + e.message);
 } finally {
-  try { edge.kill("SIGKILL"); } catch {}
+  await killBrowser(proc, PROFILE_PREFIX);
+  closeServer(server);
   try { cdp?.ws.close(); } catch {}
-  await new Promise((res) => execFile("/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe",
-    ["-NoProfile","-Command","$ErrorActionPreference='SilentlyContinue'; Get-CimInstance Win32_Process -Filter \"Name='msedge.exe'\" | Where-Object { $_.CommandLine -like '*edge-audit-*' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force }"],
-    () => res()));
 }
