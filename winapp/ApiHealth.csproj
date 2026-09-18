@@ -1,0 +1,36 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <UseWindowsForms>true</UseWindowsForms>
+    <EnableWindowsTargeting>true</EnableWindowsTargeting>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AssemblyName>ApiHealth</AssemblyName>
+    <RootNamespace>ApiHealth</RootNamespace>
+    <ApplicationIcon>wwwroot\app.ico</ApplicationIcon>
+    <Version>0.1.0</Version>
+    <SelfContained>false</SelfContained>
+    <PublishSingleFile>true</PublishSingleFile>
+    <IncludeNativeLibrariesForSelfExtract>true</IncludeNativeLibrariesForSelfExtract>
+    <DebugType>none</DebugType>
+    <SatelliteResourceLanguages>en</SatelliteResourceLanguages>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.Web.WebView2" Version="1.0.3537.50" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <EmbeddedResource Include="wwwroot\index.html" LogicalName="wwwroot/index.html" />
+    <EmbeddedResource Include="wwwroot\app.css" LogicalName="wwwroot/app.css" />
+    <EmbeddedResource Include="wwwroot\app.js" LogicalName="wwwroot/app.js" />
+    <EmbeddedResource Include="wwwroot\engine.js" LogicalName="wwwroot/engine.js" />
+    <EmbeddedResource Include="wwwroot\app.ico" LogicalName="wwwroot/app.ico" />
+    <EmbeddedResource Include="wwwroot\app-font.woff2" LogicalName="wwwroot/app-font.woff2" />
+    <EmbeddedResource Include="wwwroot\app-icon-256.png" LogicalName="wwwroot/app-icon-256.png" />
+    <EmbeddedResource Include="wwwroot\vendor\echarts.min.js" LogicalName="wwwroot/vendor/echarts.min.js" />
+  </ItemGroup>
+
+</Project>

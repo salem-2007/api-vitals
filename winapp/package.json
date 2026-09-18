@@ -1,0 +1,6 @@
+{
+  "name": "apihealth-dev",
+  "private": true,
+  "type": "module",
+  "description": "dev-only: 让 Node 能以 ESM 方式导入 wwwroot/engine.js 跑自测"
+}

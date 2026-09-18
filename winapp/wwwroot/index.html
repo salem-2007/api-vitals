@@ -1,0 +1,116 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>API 模型健康检测</title>
+<link rel="icon" href="app-icon-256.png">
+<link rel="stylesheet" href="app.css">
+<script src="vendor/echarts.min.js"></script>
+</head>
+<body>
+
+<!-- 液态流动背景层 -->
+<div id="liquid-bg" aria-hidden="true">
+  <span class="blob b1"></span>
+  <span class="blob b2"></span>
+  <span class="blob b3"></span>
+  <span class="blob b4"></span>
+  <span class="grain"></span>
+</div>
+
+<!-- Liquid Glass 折射滤镜：整页只此一份 -->
+<svg width="0" height="0" aria-hidden="true" focusable="false" style="position:fixed;top:0;left:0;pointer-events:none">
+  <defs>
+    <!-- 大面板：卡片、表格容器、配置块 -->
+    <filter id="glass-panel" x="-10%" y="-10%" width="120%" height="120%" color-interpolation-filters="sRGB">
+      <feTurbulence type="fractalNoise" baseFrequency="0.006 0.008" numOctaves="2" seed="92" result="noise" />
+      <feGaussianBlur in="noise" stdDeviation="2" result="blurred" />
+      <feDisplacementMap in="SourceGraphic" in2="blurred" scale="38" xChannelSelector="R" yChannelSelector="G" />
+    </filter>
+    <!-- 中等表面：侧栏、HUD、模态框 -->
+    <filter id="glass-distortion" x="-10%" y="-10%" width="120%" height="120%" color-interpolation-filters="sRGB">
+      <feTurbulence type="fractalNoise" baseFrequency="0.008 0.008" numOctaves="2" seed="92" result="noise" />
+      <feGaussianBlur in="noise" stdDeviation="2" result="blurred" />
+      <feDisplacementMap in="SourceGraphic" in2="blurred" scale="26" xChannelSelector="R" yChannelSelector="G" />
+    </filter>
+    <!-- 小控件：按钮、chip、开关、badge -->
+    <filter id="glass-distortion-soft" x="-10%" y="-10%" width="120%" height="120%" color-interpolation-filters="sRGB">
+      <feTurbulence type="fractalNoise" baseFrequency="0.008 0.008" numOctaves="2" seed="92" result="noise" />
+      <feGaussianBlur in="noise" stdDeviation="2" result="blurred" />
+      <feDisplacementMap in="SourceGraphic" in2="blurred" scale="10" xChannelSelector="R" yChannelSelector="G" />
+    </filter>
+  </defs>
+</svg>
+
+<header class="hud">
+  <div class="brand"><span class="logo">◉</span>API VITALS<span class="sub">模型健康检测</span></div>
+  <div class="ecg idle" id="ecg" title="体检心跳">
+    <svg viewBox="0 0 600 40" preserveAspectRatio="none">
+      <polyline class="ghost" id="ecgGhost" points=""></polyline>
+      <polyline class="sweep" id="ecgSweep" points=""></polyline>
+    </svg>
+  </div>
+  <button id="themeToggle" class="theme-toggle" title="切换外观：跟随系统 / 浅色 / 深色">
+    <span class="ic" id="themeIcon">◐</span><span id="themeLabel">跟随系统</span>
+  </button>
+  <div class="hud-stats" id="hudStats"></div>
+</header>
+
+<main>
+  <aside class="rail">
+    <div class="rail-actions">
+      <button id="btnRunQuick" class="btn primary">快速检测</button>
+      <button id="btnRunFull" class="btn">完整检测（开并发）</button>
+      <button id="btnStop" class="btn danger" disabled>停止</button>
+    </div>
+    <div class="rail-tests" id="testToggles"></div>
+    <div class="rail-title"><span>端点</span><button id="btnImport" class="btn tiny">批量导入</button></div>
+    <div class="providers" id="providers"></div>
+    <div class="rail-foot">
+      <button id="btnAddProv" class="btn tiny">+ 添加端点</button>
+    </div>
+  </aside>
+
+  <section class="stage">
+    <nav class="tabs">
+      <button data-tab="dash" class="active">仪表盘</button>
+      <button data-tab="records">记录</button>
+      <button data-tab="history">历史</button>
+      <button data-tab="config">配置</button>
+    </nav>
+    <div class="views">
+      <div class="view" id="view-dash">
+        <div class="vitals" id="vitals"></div>
+        <div class="charts">
+          <div class="chart-card"><div class="chart-title">延迟分布 · p50 / p95</div><div class="chart" id="chartLatency"></div></div>
+          <div class="chart-card"><div class="chart-title">并发测试 · 成功率 / 吞吐</div><div class="chart" id="chartConcur"></div></div>
+          <div class="chart-card"><div class="chart-title">Token 速率</div><div class="chart" id="chartTps"></div></div>
+          <div class="chart-card"><div class="chart-title">历史通过率</div><div class="chart" id="chartHistory"></div></div>
+        </div>
+      </div>
+      <div class="view hidden" id="view-records"></div>
+      <div class="view hidden" id="view-history"></div>
+      <div class="view hidden" id="view-config"></div>
+    </div>
+  </section>
+</main>
+
+<footer class="statusbar">
+  <span class="run" id="statusText">就绪</span>
+  <span id="progressText"></span>
+  <span class="ver" id="verText">v0.1.0</span>
+</footer>
+
+<div class="modal hidden" id="modal">
+  <div class="modal-box">
+    <div class="modal-title" id="modalTitle"></div>
+    <div class="modal-body" id="modalBody"></div>
+    <div class="modal-actions" id="modalActions"></div>
+  </div>
+</div>
+<div class="toasts" id="toasts"></div>
+
+<script type="module" src="app.js"></script>
+</body>
+</html>

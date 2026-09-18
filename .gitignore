@@ -1,0 +1,38 @@
+# ---------- 构建产物 ----------
+winapp/bin/
+winapp/obj/
+winapp/dist/
+*.exe
+*.dll
+*.pdb
+*.user
+
+# ---------- 依赖 ----------
+node_modules/
+*.nuget/
+
+# ---------- 测试/开发临时产物 ----------
+/tmp/
+*.log
+launch.log
+
+# ---------- 大字体原件（23MB，源码已含子集化后的 woff2）----------
+# 原始 ttf 不入库；重新生成见 winapp/tools/README.md
+winapp/*.ttf
+
+# ---------- 个人配置 / 密钥 ----------
+config.local.json
+.env
+.env.*
+*.key
+providers.local.json
+
+# ---------- 编辑器 / 系统 ----------
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ---------- 截图工作文件（README 引用的成品图在 docs/ 下）----------
+winapp/2026-*.png
