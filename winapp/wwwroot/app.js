@@ -266,6 +266,8 @@ async function applySystemFont() {
       const info = JSON.parse(r.data);
       // 内置字体是首选；系统字体作为后备族（不覆盖 --app-font）
       if (info.font) document.documentElement.dataset.sysfont = info.font;
+      // 版本号以原生壳（程序集版本）为准，避免页脚硬编码与实际发布版脱节
+      if (info.ver) { const el = document.getElementById("verText"); if (el) el.textContent = "v" + info.ver; }
     }
   } catch { /* 浏览器/探测失败：仅用内置字体 */ }
 }

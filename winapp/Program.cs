@@ -248,7 +248,8 @@ static class Program
                 case "sysinfo":
                 {
                     var (font, px) = DetectSystemFont();
-                    Reply(id, true, JsonSerializer.Serialize(new { font, px }));
+                    var ver = typeof(Program).Assembly.GetName().Version?.ToString() ?? "0";
+                    Reply(id, true, JsonSerializer.Serialize(new { font, px, ver }));
                     break;
                 }
                 case "log":

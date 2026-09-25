@@ -10,7 +10,7 @@
     <AssemblyName>ApiHealth</AssemblyName>
     <RootNamespace>ApiHealth</RootNamespace>
     <ApplicationIcon>wwwroot\app.ico</ApplicationIcon>
-    <Version>0.1.0</Version>
+    <Version>0.2.0</Version>
     <SelfContained>false</SelfContained>
     <PublishSingleFile>true</PublishSingleFile>
     <IncludeNativeLibrariesForSelfExtract>true</IncludeNativeLibrariesForSelfExtract>
