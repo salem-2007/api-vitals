@@ -501,6 +501,24 @@ td .sub { color: var(--faint); font-size: 11px; }
 
 .empty { color: var(--faint); font-size: 12px; text-align: center; padding: 40px 0; line-height: 1.9; }
 
+/* ============ 记录页：按模型汇总 展开行 ============ */
+tbody tr[data-model] { cursor: pointer; }
+tbody tr[data-model]:hover { background: var(--track-bg); }
+tbody tr.row-open { background: var(--sig-dim); }
+tbody tr.row-open td b { color: var(--sig); }
+.detail-row td { padding: 0; background: var(--panel3); }
+.detail-box { padding: 8px 14px 10px 26px; display: flex; flex-direction: column; gap: 4px; }
+.detail-line {
+  display: grid; grid-template-columns: 52px 62px 74px 128px 1fr; align-items: center;
+  gap: 10px; font: 11.5px var(--mono); color: var(--muted); padding: 3px 0;
+  border-bottom: 1px dashed var(--line); 
+}
+.detail-line:last-child { border-bottom: none; }
+.detail-line .dk { color: var(--text); }
+.detail-line .dt, .detail-line .dl { color: var(--faint); }
+.detail-line .dd { color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.detail-line .pill { padding: 1px 8px; font-size: 10px; }
+
 /* ============ 配置区 ============ */
 .cfg-sec {
   border: 1px solid var(--line); border-radius: var(--r-lg);

@@ -100,9 +100,17 @@ try {
   t("检测流程跑到完成", /^完成/.test(status), status);
   log("  状态栏：" + status);
 
+  // 记录页默认是「按模型汇总」视图；逐用例断言先切到「按用例流水」
+  await cdp.ev(`(() => {
+    const tab = [...document.querySelectorAll('#view-records .chip[data-mode]')].find(b => b.dataset.mode === 'case');
+    if (tab) tab.click();
+    return !!tab;
+  })()`);
+  await sleep(200);
+
   // 3) 结果断言
   const res = await cdp.ev(`(() => {
-    const rows = [...document.querySelectorAll('#view-records tbody tr')].map(tr =>
+    const rows = [...document.querySelectorAll('#view-records tbody tr[data-idx]')].map(tr =>
       [...tr.querySelectorAll('td')].map(td => td.textContent.trim()));
     return {
       rowCount: rows.length,
@@ -247,14 +255,41 @@ try {
     hasAll && report.csv.includes("mock-openai") && report.csv.includes("mock-fast"), 
     "len=" + report.len);
 
-  // 8) 筛选与 CSV 导出路径可用
+  // 8) 筛选与 CSV 导出路径可用（切到「按用例流水」用失败筛选）
   const filtered = await cdp.ev(`(() => {
-    document.querySelector('#view-records .chip[data-f="fail"]').click();
-    return document.querySelectorAll('#view-records tbody tr').length;
+    const caseTab = [...document.querySelectorAll('#view-records .chip[data-mode]')].find(b => b.dataset.mode === 'case');
+    if (caseTab) caseTab.click();
+    const failChip = [...document.querySelectorAll('#view-records .chip[data-f2]')].find(b => b.dataset.f2 === 'fail');
+    if (failChip) failChip.click();
+    return document.querySelectorAll('#view-records tbody tr[data-idx]').length;
   })()`);
   t("失败筛选可用", filtered === 0, "failRows=" + filtered);
   const chips = await cdp.ev(`[...document.querySelectorAll('#view-records .chip')].map(c => c.textContent.trim())`);
   t("记录页有导出报告入口", chips.some((c) => c.includes("导出报告")), JSON.stringify(chips));
+
+  // 8.1) 按模型汇总视图：应聚合出模型行，且状态含「成功」，点行可展开用例
+  const modelView = await cdp.ev(`(() => {
+    const modelTab = [...document.querySelectorAll('#view-records .chip[data-mode]')].find(b => b.dataset.mode === 'model');
+    modelTab.click();
+    const rows = [...document.querySelectorAll('#view-records tbody tr[data-model]')];
+    const first = rows[0];
+    const statuses = rows.map(r => r.children[2]?.textContent.trim());
+    first?.click();
+    const expanded = !!document.querySelector('#view-records .detail-row');
+    return { rowCount: rows.length, statuses: [...new Set(statuses)], expanded };
+  })()`);
+  log("  按模型汇总：" + JSON.stringify(modelView));
+  t("按模型汇总产生模型行", modelView.rowCount >= 2, JSON.stringify(modelView));
+  t("模型行显示三态状态", modelView.statuses.includes("成功"), JSON.stringify(modelView.statuses));
+  t("点模型行可展开用例明细", modelView.expanded === true, "expanded=" + modelView.expanded);
+
+  // 8.2) 历史页新列：模型数 / 部分 / 失败主因 表头存在
+  const histHead = await cdp.ev(`(() => {
+    document.querySelector('.tabs button[data-tab="history"]').click();
+    return [...document.querySelectorAll('#view-history thead th')].map(th => th.textContent.trim());
+  })()`);
+  log("  历史表头：" + JSON.stringify(histHead));
+  t("历史页含模型/部分/失败主因列", ["模型", "部分", "失败主因"].every((k) => histHead.includes(k)), JSON.stringify(histHead));
 } catch (e) {
   fail++;
   log("  FAIL  端到端异常: " + e.message);

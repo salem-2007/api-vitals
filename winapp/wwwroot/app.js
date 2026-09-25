@@ -164,7 +164,10 @@ const S = {
   running: false,
   abort: null,
   tab: "dash",
-  filter: "all",
+  filter: "all",        // 用例视图筛选：all | pass | fail
+  recMode: "model",     // 记录页视图：model（按模型汇总）| case（按用例流水）
+  mfilter: "all",       // 模型视图筛选：all | ok | part | fail
+  filterModel: null,    // 只看某个模型（下钻用）
   filterRun: null,
   status: "就绪",
   progress: "",
@@ -625,24 +628,129 @@ function renderCharts() {
 }
 
 // ---------------- 记录 ----------------
+// 记录页有两个视图：
+//   model（默认）—— 按「端点 × 模型」汇总成一行，直观看出每个模型是「成功 / 部分成功 / 失败」，
+//                    失败原因自动归类（无可用渠道 / 模型已下线 / 超时…），不用再逐条读红字。
+//   case         —— 原来的逐条用例流水，排查单次请求细节时用。
 function renderRecords() {
   const el = $("#view-records");
   const baseRows = S.filterRun ? S.filterRun.rows : (S.runs.length && !S.running ? S.runs[0].rows : S.rows);
-  let rows = baseRows;
+  let scoped = S.filterProv ? baseRows.filter((r) => r.provider === S.filterProv) : baseRows;
+
+  const modeTabs = `
+    <div class="chips" style="margin-bottom:10px">
+      <button class="chip ${S.recMode === "model" ? "active" : ""}" data-mode="model">按模型汇总</button>
+      <button class="chip ${S.recMode === "case" ? "active" : ""}" data-mode="case">按用例流水</button>
+      <span class="spacer"></span>
+      ${S.filterProv ? `<button class="chip active" data-f="prov">端点：${esc(S.filterProv)} ✕</button>` : ""}
+      ${S.filterRun ? `<button class="chip" data-f="exit">← 返回本轮</button>` : ""}
+      <button class="chip" data-f="report">导出报告表格</button>
+      <button class="chip" data-f="csv">导出 CSV</button>
+      <button class="chip danger" data-f="clear">清空记录</button>
+    </div>`;
+
+  el.innerHTML = modeTabs + (S.recMode === "model" ? renderRecordsModel(scoped) : renderRecordsCase(scoped, baseRows));
+
+  el.querySelectorAll(".chip[data-mode]").forEach((c) =>
+    c.addEventListener("click", () => { S.recMode = c.dataset.mode; S.filterModel = null; renderRecords(); }));
+  el.querySelectorAll(".chip[data-f]").forEach((c) => c.addEventListener("click", () => onRecordChip(c.dataset.f)));
+  // 模型视图筛选 chip（全部 / 成功 / 部分成功 / 失败）
+  el.querySelectorAll(".chip[data-mf]").forEach((c) =>
+    c.addEventListener("click", () => { S.mfilter = c.dataset.mf; renderRecords(); }));
+  // 用例流水筛选 chip（全部 / 通过 / 失败）
+  el.querySelectorAll(".chip[data-f2]").forEach((c) =>
+    c.addEventListener("click", () => { S.filter = c.dataset.f2; renderRecords(); }));
+  el.querySelector("#recLimit")?.addEventListener("change", async (e) => {
+    S.settings.recordLimit = Math.max(20, Math.min(5000, parseInt(e.target.value, 10) || 300));
+    await storeSave("settings", S.settings);
+    renderRecords();
+  });
+  if (S.recMode === "model") {
+    el.querySelectorAll("tbody tr[data-model]").forEach((tr) => {
+      tr.addEventListener("click", () => { S.filterModel = (S.filterModel === tr.dataset.model && S.filterProv === tr.dataset.prov) ? null : tr.dataset.model; S.filterProv = tr.dataset.prov; renderRecords(); });
+      tr.addEventListener("contextmenu", (e) => modelRowMenu(tr.dataset.prov, tr.dataset.model, e));
+    });
+  } else {
+    el.querySelectorAll("tbody tr[data-idx]").forEach((tr) => {
+      tr.addEventListener("contextmenu", (e) => recordMenu(Number(tr.dataset.idx), e));
+    });
+  }
+}
+
+// 视图一：按「端点 × 模型」汇总
+const MSTATUS = { "成功": "ok", "部分成功": "warn", "失败": "bad", "未测试": "" };
+function renderRecordsModel(scoped) {
+  const groups = aggregateModelResults(scoped.filter((r) => r.model));
+  let list = groups;
+  if (S.mfilter === "ok") list = list.filter((g) => g.stat.status === "成功");
+  if (S.mfilter === "part") list = list.filter((g) => g.stat.status === "部分成功");
+  if (S.mfilter === "fail") list = list.filter((g) => g.stat.status === "失败");
+  // 排序：失败 > 部分成功 > 成功，同级按端点+模型名
+  const order = { "失败": 0, "部分成功": 1, "成功": 2, "未测试": 3 };
+  list = [...list].sort((a, b) => (order[a.stat.status] - order[b.stat.status]) || (a.provider + a.model).localeCompare(b.provider + b.model));
+
+  const cnt = (st) => groups.filter((g) => g.stat.status === st).length;
+  const chips = `
+    <div class="chips">
+      <button class="chip ${S.mfilter === "all" ? "active" : ""}" data-mf="all">全部 ${groups.length}</button>
+      <button class="chip ${S.mfilter === "ok" ? "active" : ""}" data-mf="ok">成功 ${cnt("成功")}</button>
+      <button class="chip ${S.mfilter === "part" ? "active" : ""}" data-mf="part">部分成功 ${cnt("部分成功")}</button>
+      <button class="chip ${S.mfilter === "fail" ? "active" : ""}" data-mf="fail">失败 ${cnt("失败")}</button>
+      <span class="spacer"></span>
+      <span class="hint">点行展开该模型的每条用例</span>
+    </div>`;
+
+  const body = list.length ? `<div class="table-wrap"><table>
+    <thead><tr><th>端点</th><th>模型</th><th>状态</th><th>通过/共</th><th>p50</th><th>p95</th><th>TTFT</th><th>速率</th><th>失败归因</th></tr></thead>
+    <tbody>${list.map((g) => {
+      const st = g.stat;
+      const cls = MSTATUS[st.status] || "";
+      const reason = st.status === "成功" ? "" : classifyFails(g.rows);
+      const open = S.filterModel === g.model && S.filterProv === g.provider;
+      return `<tr data-model="${esc(g.model)}" data-prov="${esc(g.provider)}" class="${open ? "row-open" : ""}" title="点击展开 / 右键更多">
+        <td><b>${esc(g.provider)}</b></td>
+        <td>${esc(g.model)}</td>
+        <td><span class="pill ${cls}">${st.status}</span></td>
+        <td>${st.ok}/${st.total}</td>
+        <td>${st.p50 != null ? st.p50 + "ms" : "—"}</td>
+        <td>${st.p95 != null ? st.p95 + "ms" : "—"}</td>
+        <td>${st.ttft != null ? st.ttft + "ms" : "—"}</td>
+        <td>${st.tps != null ? st.tps + " " + (st.unit || "") : "—"}</td>
+        <td><span class="sub">${esc(reason || "—")}</span></td>
+      </tr>${open ? renderModelDetail(g.rows) : ""}`;
+    }).join("")}</tbody>
+  </table></div>` : `<div class="empty">${scoped.length ? "没有匹配的模型" : "还没有记录 · 点左侧「快速检测」开跑"}</div>`;
+
+  return chips + body;
+}
+
+// 展开某模型时，把它的每条用例作为子行铺开
+function renderModelDetail(rows) {
+  return `<tr class="detail-row"><td colspan="9"><div class="detail-box">
+    ${rows.map((r) => `<div class="detail-line">
+      <span class="pill ${r.ok ? "ok" : "bad"}">${r.ok ? "通过" : "失败"}</span>
+      <span class="dk">${KINDS[r.kind] || esc(r.kind || "")}${r.agg ? " 聚合" : ""}</span>
+      <span class="dt">${hhmmss(r.t || Date.now())}</span>
+      <span class="dl">${r.agg || r.kind === "concur" ? (r.p50 != null ? `p50 ${r.p50}/p95 ${r.p95}` : "—") : (r.latencyMs != null ? r.latencyMs + "ms" : "—")}</span>
+      <span class="dd">${esc(r.error || r.preview || "")}</span>
+    </div>`).join("")}
+  </div></td></tr>`;
+}
+
+// 视图二：逐条用例流水（保留原行为）
+function renderRecordsCase(scoped, baseRows) {
+  let rows = scoped;
   if (S.filter === "pass") rows = rows.filter((r) => r.ok);
   if (S.filter === "fail") rows = rows.filter((r) => !r.ok);
-  if (S.filterProv) rows = rows.filter((r) => r.provider === S.filterProv);
   const limit = Math.max(20, Math.min(5000, parseInt(S.settings.recordLimit, 10) || 300));
   const shown = rows.slice(-limit);
   S._shownRows = shown;
 
-  el.innerHTML = `
+  const chips = `
     <div class="chips">
-      <button class="chip ${S.filter === "all" ? "active" : ""}" data-f="all">全部 ${S.filterRun ? S.filterRun.rows.length : baseRows.length}</button>
-      <button class="chip ${S.filter === "pass" ? "active" : ""}" data-f="pass">通过 ${baseRows.filter((r) => r.ok).length}</button>
-      <button class="chip ${S.filter === "fail" ? "active" : ""}" data-f="fail">失败 ${baseRows.filter((r) => !r.ok).length}</button>
-      ${S.filterProv ? `<button class="chip active" data-f="prov">端点：${esc(S.filterProv)} ✕</button>` : ""}
-      ${S.filterRun ? `<button class="chip" data-f="exit">← 返回本轮</button>` : ""}
+      <button class="chip ${S.filter === "all" ? "active" : ""}" data-f2="all">全部 ${scoped.length}</button>
+      <button class="chip ${S.filter === "pass" ? "active" : ""}" data-f2="pass">通过 ${scoped.filter((r) => r.ok).length}</button>
+      <button class="chip ${S.filter === "fail" ? "active" : ""}" data-f2="fail">失败 ${scoped.filter((r) => !r.ok).length}</button>
       <span class="spacer"></span>
       ${rows.length > shown.length ? `<span class="hint">显示最近 ${shown.length} / ${rows.length} 条</span>` : ""}
       <label class="chip select-chip" title="最多显示多少条记录">
@@ -652,35 +760,25 @@ function renderRecords() {
         </select>
         条
       </label>
-      <button class="chip" data-f="report">导出报告表格</button>
-      <button class="chip" data-f="csv">导出 CSV</button>
-      <button class="chip danger" data-f="clear">清空记录</button>
-    </div>
-    ${shown.length ? `<div class="table-wrap"><table>
-      <thead><tr><th>时间</th><th>端点</th><th>测试</th><th>模型</th><th>结果</th><th>延迟</th><th>TTFT</th><th>速率</th><th>详情</th></tr></thead>
-      <tbody>${shown.map((r, i) => `
-        <tr data-idx="${i}" title="右键：复制 / 只看此端点 / 导出报告">
-          <td>${hhmmss(r.t || Date.now())}</td>
-          <td><b>${esc(r.provider || "")}</b></td>
-          <td>${KINDS[r.kind] || esc(r.kind || "")}${r.agg ? "<span class='sub'> 聚合</span>" : ""}</td>
-          <td>${esc(r.model || "—")}</td>
-          <td><span class="pill ${r.ok ? "ok" : "bad"}">${r.ok ? "通过" : "失败"}</span></td>
-          <td>${r.agg || r.kind === "concur" ? (r.p50 != null ? `p50 ${r.p50} / p95 ${r.p95}` : "—") : (r.latencyMs != null ? r.latencyMs + "ms" : "—")}</td>
-          <td>${r.ttftMs != null ? r.ttftMs + "ms" : "—"}</td>
-          <td>${r.tps != null ? r.tps + " " + (r.unit || "") : "—"}</td>
-          <td><span class="sub">${esc((r.error || r.preview || "").slice(0, 60))}</span></td>
-        </tr>`).join("")}</tbody>
-    </table></div>` : `<div class="empty">还没有记录 · 点左侧「快速检测」开跑</div>`}
-  `;
-  el.querySelectorAll(".chip").forEach((c) => c.addEventListener("click", () => onRecordChip(c.dataset.f)));
-  el.querySelector("#recLimit")?.addEventListener("change", async (e) => {
-    S.settings.recordLimit = Math.max(20, Math.min(5000, parseInt(e.target.value, 10) || 300));
-    await storeSave("settings", S.settings);
-    renderRecords();
-  });
-  el.querySelectorAll("tbody tr").forEach((tr) => {
-    tr.addEventListener("contextmenu", (e) => recordMenu(Number(tr.dataset.idx), e));
-  });
+    </div>`;
+
+  const body = shown.length ? `<div class="table-wrap"><table>
+    <thead><tr><th>时间</th><th>端点</th><th>测试</th><th>模型</th><th>结果</th><th>延迟</th><th>TTFT</th><th>速率</th><th>详情</th></tr></thead>
+    <tbody>${shown.map((r, i) => `
+      <tr data-idx="${i}" title="右键：复制 / 只看此端点 / 导出报告">
+        <td>${hhmmss(r.t || Date.now())}</td>
+        <td><b>${esc(r.provider || "")}</b></td>
+        <td>${KINDS[r.kind] || esc(r.kind || "")}${r.agg ? "<span class='sub'> 聚合</span>" : ""}</td>
+        <td>${esc(r.model || "—")}</td>
+        <td><span class="pill ${r.ok ? "ok" : "bad"}">${r.ok ? "通过" : "失败"}</span></td>
+        <td>${r.agg || r.kind === "concur" ? (r.p50 != null ? `p50 ${r.p50} / p95 ${r.p95}` : "—") : (r.latencyMs != null ? r.latencyMs + "ms" : "—")}</td>
+        <td>${r.ttftMs != null ? r.ttftMs + "ms" : "—"}</td>
+        <td>${r.tps != null ? r.tps + " " + (r.unit || "") : "—"}</td>
+        <td><span class="sub">${esc((r.error || r.preview || "").slice(0, 60))}</span></td>
+      </tr>`).join("")}</tbody>
+  </table></div>` : `<div class="empty">还没有记录 · 点左侧「快速检测」开跑</div>`;
+
+  return chips + body;
 }
 
 // 清空记录：可选只清当前轮 / 连历史一起清
@@ -730,7 +828,8 @@ function onRecordChip(f) {
 }
 
 function exportCsv() {
-  const baseRows = S.filterProv ? (S._shownRows || []) : (S.filterRun ? S.filterRun.rows : (S.runs[0]?.rows || S.rows));
+  const runRows = S.filterRun ? S.filterRun.rows : (S.runs[0]?.rows || S.rows);
+  const baseRows = S.filterProv ? runRows.filter((r) => r.provider === S.filterProv) : runRows;
   const prov = (name) => S.providers.find((p) => p.name === name) || {};
   const head = "时间,端点,类型,API地址,APIKey,模型,测试,结果,延迟ms,TTFTms,tokens,速率,单位,详情";
   const lines = baseRows.map((r) => {
@@ -767,17 +866,25 @@ function renderHistory() {
     <button class="chip danger" data-act="clearAll">清空全部历史</button>
   </div>
   <div class="table-wrap"><table>
-    <thead><tr><th>时间</th><th>端点</th><th>用例</th><th>通过</th><th>失败</th><th>耗时</th><th>平均延迟</th><th></th></tr></thead>
+    <thead><tr><th>时间</th><th>端点</th><th>模型</th><th>用例</th><th>通过</th><th>部分</th><th>失败</th><th>耗时</th><th>p50</th><th>失败主因</th><th></th></tr></thead>
     <tbody>${S.runs.map((r) => {
       const lat = r.rows.filter((x) => x.ok && !x.agg).map((x) => x.latencyMs);
+      // 模型级健康度：把本轮按「端点×模型」聚合，数出成功 / 部分成功 / 失败三态
+      const groups = aggregateModelResults(r.rows.filter((x) => x.model));
+      const part = groups.filter((g) => g.stat.status === "部分成功").length;
+      const badModels = groups.filter((g) => g.stat.status === "失败").length;
+      const cause = classifyFails(r.rows);
       return `<tr data-ts="${r.ts}" title="右键：查看 / 导出报告 / 删除">
         <td>${new Date(r.ts).toLocaleString("zh-CN", { hour12: false })}</td>
         <td><b>${r.providerCount}</b></td>
+        <td>${groups.length}</td>
         <td>${r.rows.length}</td>
         <td><span class="pill ok">${r.stats.pass}</span></td>
-        <td><span class="pill ${r.stats.fail ? "bad" : ""}">${r.stats.fail}</span></td>
+        <td>${part ? `<span class="pill warn">${part}</span>` : "—"}</td>
+        <td><span class="pill ${r.stats.fail ? "bad" : ""}">${r.stats.fail}</span>${badModels ? `<span class="sub"> ${badModels}模型</span>` : ""}</td>
         <td>${(r.durationMs / 1000).toFixed(1)}s</td>
         <td>${lat.length ? pct(lat, 0.5) + "ms" : "—"}</td>
+        <td><span class="sub">${esc(cause || "—")}</span></td>
         <td><button class="btn tiny" data-act="view">查看</button>
             <button class="btn tiny" data-act="report">导出报告</button>
             <button class="btn tiny" data-act="del">删除</button></td>
@@ -895,29 +1002,51 @@ function pushRow(row) {
   renderHud();
 }
 
+// 失败归因：把一条错误信息归到「主因」类别，供记录/历史/摘要复用。
+// 顺序敏感：先匹配最具体的真实上游话术（渠道不存在 / 模型下线 / 额度），再落到通用类别。
+function failClass(err) {
+  const s = String(err || "");
+  if (!s) return "";
+  if (/end of life|no longer available|已下线|下线|已停用|已弃用|deprecat/i.test(s)) return "模型已下线";
+  if (/可用渠道不存在|no available channel|no channel|渠道不存在|无可用渠道|无可用/i.test(s)) return "无可用渠道";
+  if (/usage limit|额度|quota|欠费|余额|insufficient|balance|超出限额/i.test(s)) return "额度/欠费";
+  if (/缺少关键词|不符|关键词/.test(s)) return "回答不符预期";
+  if (/空内容|空响应|empty/i.test(s)) return "空响应";
+  if (/超时|timeout|timed out/i.test(s)) return "超时";
+  if (/\b429\b|rate limit|限流|too many/i.test(s)) return "限流(429)";
+  if (/\b5\d\d\b|internal server|bad gateway|unavailable|上游/i.test(s)) return "上游5xx";
+  if (/\b40[13]\b|unauthor|forbidden|鉴权|invalid api key|api key|apikey|令牌|token/i.test(s)) return "鉴权/Key";
+  if (/\b404\b|not found|不存在的模型|model.*not.*exist/i.test(s)) return "模型不存在";
+  if (/已取消|abort|cancel/i.test(s)) return "已取消";
+  if (/非 JSON|non-json|解析|parse|结构非标准/i.test(s)) return "响应异常";
+  return "其他";
+}
+
+// 一组失败行 → 归类计数串，例如「无可用渠道 ×2 · 超时 ×1」
+// 跳过聚合行（延迟/并发的 agg 是对其它行的汇总，计进来会重复且产生「N/N 失败」噪音）
+function classifyFails(rows) {
+  const fails = rows.filter((r) => !r.ok && !r.agg);
+  if (!fails.length) return "";
+  const by = new Map();
+  for (const r of fails) {
+    const k = failClass(r.error || r.preview || "失败") || "其他";
+    by.set(k, (by.get(k) || 0) + 1);
+  }
+  return [...by.entries()]
+    .sort((a, b) => b[1] - a[1])
+    .map(([k, n]) => `${k}${n > 1 ? " ×" + n : ""}`)
+    .join(" · ");
+}
+
 // 失败归因：把失败按「主因」聚成一句结论，避免只看一堆红字不知道问题在哪
 function summarizeFailures(rows) {
   const fails = rows.filter((r) => !r.ok);
   if (!fails.length) return "";
-  const cls = (e) => {
-    const s = String(e || "");
-    if (/缺少关键词/.test(s)) return "回答不符预期";
-    if (/空内容/.test(s)) return "空响应";
-    if (/超时/.test(s)) return "超时";
-    if (/429/.test(s)) return "限流(429)";
-    if (/5\d\d/.test(s)) return "上游5xx";
-    if (/401|403|鉴权|key/i.test(s)) return "鉴权/额度";
-    if (/已取消/.test(s)) return "已取消";
-    return "其他";
-  };
   const by = new Map();
-  for (const r of fails) {
-    const k = cls(r.error);
-    by.set(k, (by.get(k) || 0) + 1);
-  }
   const aff = new Map();  // 受影响的模型
   for (const r of fails) {
-    const k = cls(r.error);
+    const k = failClass(r.error || r.preview || "失败") || "其他";
+    by.set(k, (by.get(k) || 0) + 1);
     if (!aff.has(k)) aff.set(k, new Set());
     if (r.model) aff.get(k).add(r.model);
   }
@@ -1723,6 +1852,28 @@ const rowTsv = (r) => [
   r.agg ? `p50 ${r.p50} / p95 ${r.p95}` : (r.latencyMs ?? ""),
   r.ttftMs ?? "", r.tps != null ? `${r.tps} ${r.unit || ""}` : "", r.error || r.preview || "",
 ].join("\t");
+
+// 「按模型汇总」行的右键菜单：复制模型名 / 只看此端点 / 复制失败原因 / 导出
+function modelRowMenu(prov, model, e) {
+  const rows = currentRows().filter((r) => r.provider === prov && r.model === model);
+  if (!rows.length) return;
+  const st = modelStat(rows);
+  const reason = classifyFails(rows);
+  const items = [
+    cp(model, "模型名"),
+    cp(prov, "端点"),
+    { label: `复制状态摘要（${st.status}）`, fn: () => copyText(`${prov} / ${model} · ${st.status} · 通过 ${st.ok}/${st.total}${reason ? " · " + reason : ""}`, "摘要") },
+  ];
+  if (st.status !== "成功" && rows.some((r) => !r.ok)) {
+    items.push({ label: "复制失败原因（全文）", fn: () => copyText([...new Set(rows.filter((r) => !r.ok).map((r) => r.error || r.preview || "").filter(Boolean))].join("\n"), "失败原因") });
+  }
+  items.push(
+    { sep: true },
+    { label: "只看此端点", fn: () => { S.filterProv = prov; renderRecords(); } },
+    { label: "导出报告表格（CSV）", fn: () => exportReportCsv(S.filterRun || { ts: rowSourceTs(), rows: currentRows() }) },
+  );
+  menuAt(e, model || "模型", items);
+}
 
 function historyMenu(ts, e) {
   const r = S.runs.find((x) => x.ts === ts);
