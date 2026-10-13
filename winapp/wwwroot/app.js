@@ -1,15 +1,15 @@
-// app.js — UI 层：状态、桥接、渲染、检测编排
+// app.js — UI 层：状态、桥接、渲染、检测编排、视觉裁判、报告
 import {
-  DEFAULT_PROMPTS, TYPES, ADAPTERS,
-  opConnectivity, opChat, opChatRetry, opLatency, opConcurrent, listModels,
-  avg, pct, sleep, concurrencyVerdict,
+  GROUPS, QUESTIONS, SVG_TASKS, TYPES, ADAPTERS, buildSvgPrompt,
+  listModels, opAskQuestion, opGenSvg, opJudgeSvg, opJudgeAnswer, runPool,
+  modelStats, groupStats, runStats, flattenRun, buildReportCsv, buildShareText,
+  starsText, sanitizeSvg, ensureSvgSize, svgDataUrl, sleep,
 } from "./engine.js";
 
-// ---------------- 桥接（WebView2 原生壳 / 浏览器 fallback） ----------------
+// ==================== 桥接（WebView2 原生壳 / 浏览器回退） ====================
 const inWV = !!(window.chrome && window.chrome.webview);
 let _mid = 0;
 const _pend = new Map();
-
 function invoke(cmd, payload = {}) {
   if (!inWV) return Promise.resolve({ ok: false, data: null, native: false });
   return new Promise((resolve) => {
@@ -24,16 +24,15 @@ if (inWV) {
     if (m && m.id && _pend.has(m.id)) { _pend.get(m.id)(m); _pend.delete(m.id); }
   });
 }
-
 async function storeLoad(name, fallback) {
   try {
     const r = await invoke("load", { name });
     if (r && r.ok && r.data) return JSON.parse(r.data);
-  } catch {}
+  } catch { /* 回退 */ }
   try {
-    const v = localStorage.getItem("ah_" + name);
+    const v = localStorage.getItem("iq_" + name);
     if (v) return JSON.parse(v);
-  } catch {}
+  } catch { /* 回退 */ }
   return fallback;
 }
 async function storeSave(name, obj) {
@@ -41,18 +40,15 @@ async function storeSave(name, obj) {
   try {
     const r = await invoke("save", { name, data: s });
     if (r && r.ok) return;
-  } catch {}
-  try { localStorage.setItem("ah_" + name, s); } catch {}
+  } catch { /* 回退 */ }
+  try { localStorage.setItem("iq_" + name, s); } catch { /* 无存储 */ }
 }
-
-// ---------------- 剪贴板（原生桥优先，浏览器回退） ----------------
 async function clipRead() {
   try {
     const r = await invoke("clipread");
     if (r && r.ok && typeof r.data === "string" && r.data.trim()) return r.data;
-  } catch {}
-  try { return await navigator.clipboard.readText(); } catch {}
-  return "";
+  } catch { /* 回退 */ }
+  try { return await navigator.clipboard.readText(); } catch { return ""; }
 }
 async function clipWrite(text) {
   const t = String(text ?? "");
@@ -60,39 +56,43 @@ async function clipWrite(text) {
   try {
     const r = await invoke("clipwrite", { data: t });
     if (r && r.ok) return true;
-  } catch {}
+  } catch { /* 回退 */ }
   try { await navigator.clipboard.writeText(t); return true; } catch { return false; }
 }
 async function copyText(text, label) {
   if (!text) { toast("没有可复制的内容" + (label ? "（" + label + "）" : ""), "bad"); return; }
   const ok = await clipWrite(text);
-  toast(ok ? "已复制" + (label ? "：" + label : "") : "复制失败（剪贴板不可用）", ok ? "ok" : "bad");
+  toast(ok ? "已复制" + (label ? "：" + label : "") : "复制失败", ok ? "ok" : "bad");
+}
+function saveFile(name, text) {
+  if (inWV) {
+    invoke("save", { name, data: text }).then((r) =>
+      toast(r && r.ok ? "已保存到数据目录：" + name : "保存失败", r && r.ok ? "ok" : "bad"));
+  } else {
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(new Blob([text], { type: "text/plain;charset=utf-8" }));
+    a.download = name; a.click();
+  }
 }
 
-// ---------------- 从任意文本识别连接信息 ----------------
+// ==================== 从文本识别连接信息 ====================
 const KEY_PATTERNS = [
-  /sk-ant-[A-Za-z0-9_\-]{10,}/,
-  /\bsk-[A-Za-z0-9_\-]{12,}/,
-  /\bAIza[0-9A-Za-z_\-]{20,}/,
-  /\bxai-[A-Za-z0-9_\-]{10,}/,
-  /\bgsk_[A-Za-z0-9_\-]{10,}/,
-  /\bBearer\s+([A-Za-z0-9_\-.{}]{12,})/i,
+  /sk-ant-[A-Za-z0-9_\-]{10,}/, /\bsk-[A-Za-z0-9_\-]{12,}/, /\bAIza[0-9A-Za-z_\-]{20,}/,
+  /\bxai-[A-Za-z0-9_\-]{10,}/, /\bgsk_[A-Za-z0-9_\-]{10,}/, /\bBearer\s+([A-Za-z0-9_\-.{}]{12,})/i,
 ];
 const KEY_LABEL = /(?:api[\s_-]?key|apiKey|密钥|密匙|令牌|token|key)\s*[:=＝]?\s*["'`]?([A-Za-z0-9_\-.]{16,})["'`]?/i;
-
 function detectKey(t) {
   for (const p of KEY_PATTERNS) {
-    const m = t.match(p);
+    const m = String(t).match(p);
     if (m) return String(m[1] || m[0]).replace(/^Bearer\s+/i, "").replace(/[.,;]+$/, "");
   }
-  const lm = t.match(KEY_LABEL);
+  const lm = String(t).match(KEY_LABEL);
   return lm ? lm[1] : "";
 }
-function detectUrl(t) {
+const detectUrl = (t) => {
   const m = String(t).match(/https?:\/\/[^\s"'`<>（）()【】，,、;；\]]+/i);
   return m ? m[0].replace(/[.,;:]+$/, "") : "";
-}
-// 归一化 BaseURL：去掉接口后缀，按协议补版本前缀
+};
 function normalizeBase(u, type) {
   let s = String(u || "").trim().replace(/\/+$/, "");
   s = s.replace(/\/(chat\/completions|completions|messages|responses|models)$/i, "");
@@ -109,1934 +109,99 @@ function detectType(u, key) {
   return "openai";
 }
 const hostName = (u) => { try { return new URL(u).host; } catch { return String(u || "").slice(0, 24); } };
-
-// 从任意文本（剪贴板 / JSON / 粘贴的行）里抽出端点连接信息
 function parseConnText(text) {
   const t = String(text || "").trim();
   if (!t || t.length > 20000) return null;
-
-  // 1) JSON：优先 baseUrl / url + apiKey / key
   const jm = t.match(/\{[\s\S]{2,4000}?\}/);
   if (jm) {
     try {
       const j = JSON.parse(jm[0]);
-      const baseUrl = j.baseUrl || j.base_url || j.url || j.endpoint || j.api || "";
+      const baseUrl = j.baseUrl || j.base_url || j.url || j.endpoint || "";
       const apiKey = j.apiKey || j.api_key || j.key || j.token || j.secret || "";
       if (baseUrl) {
         const type = TYPES.some((x) => x.value === j.type) ? j.type : detectType(baseUrl, apiKey);
-        return { name: j.name || hostName(baseUrl), type, baseUrl: normalizeBase(baseUrl, type), apiKey: String(apiKey || "").replace(/^Bearer\s+/i, "") };
+        return { name: j.name || hostName(baseUrl), type, baseUrl: normalizeBase(baseUrl, type), apiKey: String(apiKey).replace(/^Bearer\s+/i, "") };
       }
-    } catch { /* 不是 JSON，继续 */ }
+    } catch { /* 非 JSON */ }
   }
-
-  // 2) 通用：URL + Key
   const url = detectUrl(t);
   let key = detectKey(t);
-  // 2.1) Gemini 风格 ?key=xxx
   if (!key && url) { const q = url.match(/[?&]key=([A-Za-z0-9_\-.]{12,})/i); if (q) key = q[1]; }
-  if (!url && !key) {
-    // 2.2) 只有 Key：不可用，但提示出来
-    return null;
-  }
+  if (!url && !key) return null;
   const type = detectType(url, key);
   const cleanUrl = url.replace(/[?&](key|api_key|apiKey)=[^&]+/i, "");
   return { name: hostName(cleanUrl), type, baseUrl: cleanUrl ? normalizeBase(cleanUrl, type) : "", apiKey: key };
 }
 
-// ---------------- 状态 ----------------
+// ==================== 状态 ====================
 const DEFAULT_SETTINGS = {
-  timeoutMs: 60000, connectTimeoutMs: 15000, latencyN: 3,
-  concurN: 4,        // 并发数（开关打开时一次并行发起的请求数）
-  concurEnabled: false,   // 并发总开关
-  retries: 1,        // 可重试失败的自动重试次数
-  gapMs: 150,
-  recordLimit: 300,  // 记录页最多显示多少条（避免长跑后卡）
-  theme: "auto",   // auto | light | dark
-  tests: { connect: true, latency: true, stream: true, tps: true, concur: false },
+  concurrency: 2, timeoutSec: 120, maxTokens: 4096, retries: 2,
+  svgMaxTokens: 8192, svgTemperature: 0.4, judgeMaxTokens: 2048,
+  judgeOn: true, svgOn: true, judgeModel: "", theme: "auto", followLog: true,
+  qEnabled: {}, taskEnabled: {},
 };
-
 const S = {
-  providers: [],
-  settings: JSON.parse(JSON.stringify(DEFAULT_SETTINGS)),
-  prompts: [],
-  runs: [],
-  rows: [],
-  running: false,
-  abort: null,
-  tab: "dash",
-  filter: "all",        // 用例视图筛选：all | pass | fail
-  recMode: "model",     // 记录页视图：model（按模型汇总）| case（按用例流水）
-  mfilter: "all",       // 模型视图筛选：all | ok | part | fail
-  filterModel: null,    // 只看某个模型（下钻用）
-  filterRun: null,
-  status: "就绪",
-  progress: "",
+  providers: [], settings: { ...DEFAULT_SETTINGS },
+  runs: [], current: null, running: false, abort: null,
+  tab: "monitor", status: "就绪", progress: "",
+  timeline: [], gen: null,
+  filter: { model: "", group: "", ok: "" },
+  expanded: new Set(),
+  runFilter: null,
+  runCursor: null, doneIds: null,
 };
 
-const $ = (sel) => document.querySelector(sel);
+const $ = (s) => document.querySelector(s);
 const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 const hhmmss = (ts) => new Date(ts).toLocaleTimeString("zh-CN", { hour12: false });
 const uid = () => "p" + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
-
-const KINDS = { connect: "连通", chat: "对话", latency: "延迟", stream: "流式", tps: "速率", concur: "并发" };
 const TYPE_LABEL = Object.fromEntries(TYPES.map((t) => [t.value, t.label]));
+const qById = (id) => QUESTIONS.find((q) => q.id === id);
+const taskById = (id) => SVG_TASKS.find((t) => t.id === id);
+const enabledQuestions = () => QUESTIONS.filter((q) => S.settings.qEnabled[q.id] !== false);
+const enabledTasks = () => SVG_TASKS.filter((t) => S.settings.taskEnabled[t.id] !== false);
+const currentRun = () => (S.runFilter ? S.runs.find((r) => r.ts === S.runFilter) : (S.runs[0] || S.current));
+const selModels = (p) => (p.selModels && p.selModels.length ? p.selModels : (p.models || []).slice(0, 2));
 
-// ---------------- 主题（日夜模式） ----------------
+// ==================== 主题 ====================
 const mqDark = window.matchMedia("(prefers-color-scheme: dark)");
-
-function effectiveTheme() {
+const effTheme = () => {
   const t = S.settings.theme || "auto";
-  if (t === "light" || t === "dark") return t;
-  return mqDark.matches ? "dark" : "light";
-}
-
+  return t === "light" || t === "dark" ? t : (mqDark.matches ? "dark" : "light");
+};
 function applyTheme() {
-  const eff = effectiveTheme();
-  document.documentElement.dataset.theme = eff;
-  const mode = S.settings.theme || "auto";
-  const meta = { auto: ["◐", "跟随系统"], light: ["☀", "浅色"], dark: ["☾", "深色"] }[mode];
-  const ic = document.getElementById("themeIcon");
-  const lb = document.getElementById("themeLabel");
-  if (ic) ic.textContent = meta[0];
-  if (lb) lb.textContent = meta[1];
-  Object.values(charts).forEach((c) => { try { c.dispose(); } catch {} });
-  Object.keys(charts).forEach((k) => delete charts[k]);
-  renderCharts();
-  // 同步原生窗口装饰（圆角 + 标题栏明暗）
-  invoke("chrome", { data: eff });
+  document.documentElement.dataset.theme = effTheme();
+  invoke("chrome", { data: effTheme() });
 }
-
 function cycleTheme() {
   const order = ["auto", "light", "dark"];
   const cur = S.settings.theme || "auto";
-  setTheme(order[(order.indexOf(cur) + 1) % 3]);
-}
-
-function setTheme(mode) {
-  S.settings.theme = ["auto", "light", "dark"].includes(mode) ? mode : "auto";
+  S.settings.theme = order[(order.indexOf(cur) + 1) % 3];
   storeSave("settings", S.settings);
   applyTheme();
-  renderConfig();
 }
-
-mqDark.addEventListener("change", () => {
-  if ((S.settings.theme || "auto") === "auto") applyTheme();
-});
-
-// 读取当前主题下的 CSS 变量，供图表使用
-function pal() {
-  const cs = getComputedStyle(document.documentElement);
-  const g = (n, f) => (cs.getPropertyValue(n) || f).trim();
-  return {
-    text: g("--text", "#E7EFF7"), muted: g("--muted", "#8B98A7"), faint: g("--faint", "#5A6675"),
-    line: g("--line2", "#2A374A"), grid: g("--grid", "rgba(255,255,255,.05)"),
-    sig: g("--sig", "#3EE08F"), warn: g("--warn", "#FFC24B"),
-    danger: g("--danger", "#FF6161"), info: g("--info", "#58C7F3"),
-    panel2: g("--panel2", "#131B25"), sigDim: g("--sig-dim", "rgba(62,224,143,.12)"),
-  };
-}
-
-// 跟随系统字体：内置字体优先，系统探测字体作为后备族
-async function applySystemFont() {
-  try {
-    // 内置字体（随包分发）是否真的加载成功 —— 写进原生日志便于验证打包结果
-    try {
-      await document.fonts.ready;
-      const face = [...document.fonts].find((f) => f.family.replace(/["']/g, "") === "App Round");
-      // 宽度差异法：内置字体生效时宽度应与缺失字体不同
-      const w = (ff) => {
-        const d = document.createElement("span");
-        d.style.cssText = "position:absolute;visibility:hidden;font-size:40px;white-space:nowrap;font-family:" + ff;
-        d.textContent = "字体测试 ABC 123";
-        document.body.appendChild(d);
-        const r = d.getBoundingClientRect().width;
-        d.remove();
-        return Math.round(r * 10) / 10;
-      };
-      const appW = w('"App Round"');
-      const missW = w('"NoSuchFontXYZ"');
-      invoke("log", {
-        data: `font bundled=${face ? face.status : "absent"} applied=${appW !== missW} (${appW} vs ${missW}) sysfont=${document.documentElement.dataset.sysfont || "-"}`,
-      });
-    } catch (e) {
-      invoke("log", { data: "font probe failed: " + (e && e.message) });
-    }
-    const r = await invoke("sysinfo");
-    if (r && r.ok && r.data && inWV) {
-      const info = JSON.parse(r.data);
-      // 内置字体是首选；系统字体作为后备族（不覆盖 --app-font）
-      if (info.font) document.documentElement.dataset.sysfont = info.font;
-      // 版本号以原生壳（程序集版本）为准，避免页脚硬编码与实际发布版脱节
-      if (info.ver) { const el = document.getElementById("verText"); if (el) el.textContent = "v" + info.ver; }
-    }
-  } catch { /* 浏览器/探测失败：仅用内置字体 */ }
-}
-
-// 缩短端点名，避免图表 X 轴标签被截断
-const shortP = (s) => {
-  const t = String(s || "").split("·")[0].trim();
-  return t.length > 7 ? t.slice(0, 7) + "…" : t;
-};
-
-// 配置迁移：清理已废弃字段 + 纠正无效值（旧版把并发数存成 1，等于没开并发）
-function migrateSettings(old) {
-  let changed = false;
-  // 1) 并发数 <2 时并发测试无意义，纠正为默认 4
-  const cn = parseInt(S.settings.concurN, 10);
-  if (!Number.isFinite(cn) || cn < 2) { S.settings.concurN = 4; changed = true; }
-  // 2) 清理已废弃的「并发阶梯」字段（现为固定并发数模型）
-  for (const k of ["rampLevels", "rampPerLevel"]) {
-    if (k in S.settings) { delete S.settings[k]; changed = true; }
-  }
-  if (S.settings.tests && "ramp" in S.settings.tests) { delete S.settings.tests.ramp; changed = true; }
-  // 3) 重试次数兜底
-  if (!Number.isFinite(parseInt(S.settings.retries, 10))) { S.settings.retries = DEFAULT_SETTINGS.retries; changed = true; }
-  if (changed) {
-    storeSave("settings", S.settings);
-    invoke("log", { data: "settings migrated (concurN/legacy-ramp fields normalized)" });
-  }
-  return changed;
-}
-
-// ---------------- 初始化 ----------------
-(async function init() {
-  S.providers = (await storeLoad("providers", [])) || [];
-  const st = (await storeLoad("settings", null)) || {};
-  S.settings = { ...DEFAULT_SETTINGS, ...st, tests: { ...DEFAULT_SETTINGS.tests, ...(st.tests || {}) } };
-  migrateSettings(st);
-  S.prompts = (await storeLoad("prompts", null)) || DEFAULT_PROMPTS.slice();
-  S.runs = (await storeLoad("history", [])) || [];
-
-  await applySystemFont();
-  applyTheme();
-  renderToggles();
-  renderProviders();
-  renderAll();
-  bindStatic();
-  drawEcg();
-  ecgState("idle");
-  setStatus("就绪");
-})();
-
-// ---------------- ECG ----------------
-function drawEcg() {
-  const pts = [];
-  const beat = (t) => {
-    if (t < 0.30) return 22;      // 基线
-    if (t < 0.38) return 18;      // P
-    if (t < 0.44) return 22;
-    if (t < 0.47) return 26;      // Q
-    if (t < 0.50) return 4;       // R
-    if (t < 0.53) return 30;      // S
-    if (t < 0.60) return 22;
-    if (t < 0.72) return 15;      // T
-    return 22;
-  };
-  for (let x = 0; x <= 600; x += 2) pts.push(x + "," + beat((x % 100) / 100));
-  const p = pts.join(" ");
-  $("#ecgGhost").setAttribute("points", p);
-  $("#ecgSweep").setAttribute("points", p);
-}
-function ecgState(s) {
-  const el = $("#ecg");
-  el.classList.remove("idle", "busy", "bad", "ok");
-  el.classList.add(s);
-}
-
-// ---------------- 基础渲染 ----------------
-function setStatus(t) { S.status = t; $("#statusText").textContent = t; }
-function setProgress(t) { S.progress = t; $("#progressText").textContent = t; }
-
-function renderHud() {
-  const run = S.runs[0];
-  const el = $("#hudStats");
-  if (!run) {
-    el.innerHTML = `<span>端点 <b>${S.providers.length}</b></span><span>等待首次检测</span>`;
-    return;
-  }
-  const { pass, fail } = run.stats;
-  el.innerHTML =
-    `<span>端点 <b>${run.providerCount}</b></span>` +
-    `<span>通过 <b class="good">${pass}</b></span>` +
-    `<span>失败 <b class="bad">${fail}</b></span>` +
-    `<span>上次 <b>${hhmmss(run.ts)}</b></span>`;
-}
-
-function renderToggles() {
-  const el = $("#testToggles");
-  const items = [
-    ["connect", "连通"], ["latency", "延迟"], ["stream", "流式"], ["tps", "Token速率"], ["concur", "并发"],
-  ];
-  el.innerHTML = items.map(([k, label]) =>
-    `<label class="chk"><input type="checkbox" data-test="${k}" ${S.settings.tests[k] ? "checked" : ""}>${label}</label>`
-  ).join("");
-  el.querySelectorAll("input").forEach((cb) => {
-    cb.addEventListener("change", async () => {
-      S.settings.tests[cb.dataset.test] = cb.checked;
-      await storeSave("settings", S.settings);
-    });
-  });
-}
-
-function provLamp(p) {
-  const rows = latestRowsFor(p.name);
-  if (!rows.length) return "";
-  const bad = rows.some((r) => !r.ok);
-  return bad ? "bad" : "ok";
-}
-function latestRowsFor(name) {
-  const src = S.runs[0] ? (S.filterRun && S.filterRun.rows ? S.filterRun.rows : S.runs[0].rows) : S.rows;
-  return src.filter((r) => r.provider === name);
-}
-
-function renderProviders() {
-  const el = $("#providers");
-  if (!S.providers.length) {
-    el.innerHTML = `<div class="empty">暂无端点<br>用「批量导入」一次加一堆</div>`;
-    $("#hudStats") && renderHud();
-    return;
-  }
-  el.innerHTML = S.providers.map((p) => {
-    const lamp = provLamp(p);
-    const testing = !!(S.runCursor && S.runCursor.id === p.id);
-    const done = !!(S.doneIds && S.doneIds.has(p.id));
-    const modelAttrs = (p.models || []).map((m) => ` data-model="${esc(m)}"`).join("");
-    const cls = ["prov", p.enabled === false ? "disabled" : "", testing ? "testing" : "", done && !testing ? "done" : ""].filter(Boolean).join(" ");
-    return `<div class="${cls}" data-id="${p.id}"${modelAttrs} title="左键编辑 · 右键更多">
-      <div class="pname">
-        <span class="lamp ${testing ? "busy" : lamp}"></span>
-        <span class="nm">${esc(p.name)}</span>
-        ${testing ? `<span class="pstate"><span class="spin"></span><span class="ptxt">${esc(S.runCursor.phase || "检测中")}</span></span>` : ""}
-        ${done && !testing ? `<span class="pstate ok">✓ 已测</span>` : ""}
-      </div>
-      <div class="pmeta">${esc(p.baseUrl)}</div>
-      <div class="row2">
-        <span class="badge">${TYPE_LABEL[p.type] || p.type}</span>
-        <span class="badge">${p.models?.length ? p.models.length + " 模型" : "未拉取"}</span>
-      </div>
-    </div>`;
-  }).join("");
-  el.querySelectorAll(".prov").forEach((node) => {
-    node.addEventListener("click", () => editProvider(node.dataset.id));
-    node.addEventListener("contextmenu", (e) => providerMenu(node.dataset.id, e));
-  });
-}
-
-// ---- 检测进行态：只更新当前端点卡的阶段文字，避免整表重渲染 ----
-function markProvTesting(id, phaseText) {
-  S.runCursor = id ? { id, phase: phaseText || "检测中" } : null;
-  renderProviders();
-  renderVitals();
-}
-function setProvPhase(phaseText) {
-  if (!S.runCursor) return;
-  S.runCursor.phase = phaseText;
-  const node = document.querySelector(`.prov[data-id="${S.runCursor.id}"] .ptxt`);
-  if (node) node.textContent = phaseText;
-  const vnode = document.querySelector(`#vitals .vit[data-id="${S.runCursor.id}"] .vphase`);
-  if (vnode) vnode.textContent = phaseText;
-}
-function markProvDone(id) {
-  if (!S.doneIds) S.doneIds = new Set();
-  if (id) S.doneIds.add(id);
-  if (S.runCursor && S.runCursor.id === id) S.runCursor = null;
-  renderProviders();
-  renderVitals();
-}
-
-// ---------------- 仪表盘 ----------------
-function renderVitals() {
-  const el = $("#vitals");
-  if (!S.providers.length) { el.innerHTML = `<div class="empty">添加端点后开始检测</div>`; return; }
-  el.innerHTML = S.providers.map((p) => {
-    const rows = latestRowsFor(p.name);
-    const lamp = provLamp(p);
-    const testingE = !!(S.runCursor && S.runCursor.id === p.id);
-    if (!rows.length) {
-      return `<div class="vit ${testingE ? "testing" : ""}" data-id="${p.id}"><div class="vname"><span class="lamp ${testingE ? "busy" : ""}"></span><span class="nm">${esc(p.name)}</span></div>
-        <div class="vrow"><span>状态</span><b class="vphase">${testingE ? esc(S.runCursor.phase || "检测中") : "未检测"}</b></div></div>`;
-    }
-    const conn = rows.find((r) => r.kind === "connect");
-    const conv = rows.filter((r) => ["chat", "tps", "stream"].includes(r.kind) && r.ok);
-    const lat = conv.map((r) => r.latencyMs);
-    const tpsRows = rows.filter((r) => r.tps != null);
-    const tpsAvg = tpsRows.length ? Math.round(avg(tpsRows.map((r) => r.tps)) * 10) / 10 : null;
-    const stream = rows.filter((r) => r.kind === "stream").pop();
-    const conc = rows.filter((r) => r.kind === "concur").pop();
-    const fails = rows.filter((r) => !r.ok).length;
-    const models = [...new Set(rows.map((r) => r.model).filter(Boolean))];
-    const testing = !!(S.runCursor && S.runCursor.id === p.id);
-    return `<div class="vit ${testing ? "testing" : ""}" data-id="${p.id}" title="右键：复制 / 获取模型 / 检测该端点">
-      <div class="vname"><span class="lamp ${testing ? "busy" : lamp}"></span><span class="nm">${esc(p.name)}</span><span class="badge">${TYPE_LABEL[p.type] || p.type}</span></div>
-      ${testing ? `<div class="vrow"><span>状态</span><b class="vphase">${esc(S.runCursor.phase || "检测中")}</b></div>` : ""}
-      <div class="vrow"><span>连通</span><b class="${conn ? (conn.ok ? "good" : "bad") : ""}">${conn ? (conn.ok ? "正常 " + conn.latencyMs + "ms" : "失败") : "—"}</b></div>
-      <div class="vrow"><span>延迟 p50</span><b>${lat.length ? pct(lat, 0.5) + "ms" : "—"}</b></div>
-      <div class="vrow"><span>速率</span><b>${tpsAvg != null ? tpsAvg + " tok/s" : "—"}</b></div>
-      <div class="vrow"><span>流式</span><b class="${stream ? (stream.ok ? "good" : "bad") : ""}">${stream ? (stream.ok ? "正常 · " + (stream.streamInfo?.chunks ?? "?") + " 块" : "失败") : "—"}</b></div>
-      ${conc ? `<div class="vrow"><span>并发 ${conc.concurrency ?? ""}</span><b class="${conc.ok ? "good" : "bad"}">${conc.ok ? "全部通过" : (conc.error || "有失败").slice(0, 24)}</b></div>` : ""}
-      <div class="vrow"><span>模型</span><b>${models.length ? models.join(", ").slice(0, 40) : "—"}</b></div>
-      <div class="vrow"><span>本轮</span><b class="${fails ? "bad" : "good"}">${fails ? fails + " 失败" : "全部通过"}</b></div>
-    </div>`;
-  }).join("");
-  el.querySelectorAll(".vit").forEach((node) => {
-    node.addEventListener("contextmenu", (e) => providerMenu(node.dataset.id, e));
-  });
-}
-
-// ---------------- 图表 ----------------
-const charts = {};
-function chartSrc() { return S.runs[0] || { rows: S.rows, concur: [] }; }
-
-function ensureChart(id) {
-  if (!window.echarts) return null;
-  if (!charts[id]) {
-    const el = document.getElementById(id);
-    if (!el) return null;
-    charts[id] = window.echarts.init(el, null, { renderer: "canvas" });
-  }
-  return charts[id];
-}
-const eco = () => {
-  const P = pal();
-  return {
-    textStyle: { color: P.muted, fontFamily: "Consolas, monospace", fontSize: 10 },
-    grid: { left: 46, right: 18, top: 28, bottom: 26 },
-    tooltip: { backgroundColor: P.panel2, borderColor: P.line, textStyle: { color: P.text, fontSize: 11 } },
-    legend: { textStyle: { color: P.muted, fontSize: 10 }, top: 0, right: 4 },
-  };
-};
-function emptyOption(text) {
-  const P = pal();
-  return { ...eco(), xAxis: { show: false }, yAxis: { show: false }, series: [],
-    graphic: { type: "text", left: "center", top: "middle", style: { text, fill: P.faint, fontSize: 11 } } };
-}
-
-function renderCharts() {
-  const src = chartSrc();
-  const P = pal();
-  // 1) 延迟分布
-  const c1 = ensureChart("chartLatency");
-  if (c1 && c1.getDom() && !c1.getDom().dataset.ctxBound) {
-    c1.getDom().dataset.ctxBound = "1";
-    c1.getDom().addEventListener("contextmenu", (e) => chartMenu("chartLatency", e));
-  }
-  if (c1) {
-    const rows = (src.rows || []).filter((r) => r.kind === "latency" && r.agg);
-    if (!rows.length) c1.setOption(emptyOption("运行检测后显示延迟分布"), true);
-    else {
-      const labels = rows.map((r) => `${shortP(r.provider)}·${r.model}`);
-      c1.setOption({
-        ...eco(),
-        grid: { left: 46, right: 18, top: 28, bottom: 54 },
-        xAxis: { type: "category", data: labels, axisLabel: { interval: 0, rotate: 22, fontSize: 9 }, axisLine: { lineStyle: { color: P.line } } },
-        yAxis: { type: "value", name: "ms", splitLine: { lineStyle: { color: P.grid } } },
-        series: [
-          { name: "p50", type: "bar", data: rows.map((r) => r.p50), itemStyle: { color: P.sig }, barWidth: 14, borderRadius: [2, 2, 0, 0] },
-          { name: "p95", type: "bar", data: rows.map((r) => r.p95), itemStyle: { color: P.info }, barWidth: 14, borderRadius: [2, 2, 0, 0] },
-        ],
-      }, true);
-    }
-  }
-  // 2) 并发测试（固定并发数：成功率 / 吞吐）
-  const c2 = ensureChart("chartConcur");
-  if (c2 && c2.getDom() && !c2.getDom().dataset.ctxBound) {
-    c2.getDom().dataset.ctxBound = "1";
-    c2.getDom().addEventListener("contextmenu", (e) => chartMenu("chartConcur", e));
-  }
-  if (c2) {
-    const cur = src.concur || [];
-    if (!cur.length) c2.setOption(emptyOption("打开「并发」开关后显示并发测试结果"), true);
-    else {
-      const labels = cur.map((r) => `${shortP(r.provider)}·${r.model}`);
-      c2.setOption({
-        ...eco(),
-        grid: { left: 46, right: 48, top: 28, bottom: 54 },
-        xAxis: { type: "category", data: labels, axisLabel: { interval: 0, rotate: 22, fontSize: 9 }, axisLine: { lineStyle: { color: P.line } } },
-        yAxis: [
-          { type: "value", max: 100, name: "成功率%", splitLine: { lineStyle: { color: P.grid } } },
-          { type: "value", name: "req/s", splitLine: { show: false } },
-        ],
-        series: [
-          {
-            name: "成功率", type: "bar", barMaxWidth: 24, borderRadius: [2, 2, 0, 0],
-            data: cur.map((r) => Math.round((r.ok / Math.max(1, r.ok + r.fail)) * 100)),
-            itemStyle: { color: (pv) => (pv.value >= 100 ? P.sig : pv.value > 0 ? P.warn : P.danger) },
-          },
-          {
-            name: "吞吐 req/s", type: "line", yAxisIndex: 1, symbolSize: 6,
-            data: cur.map((r) => r.throughput ?? null),
-            itemStyle: { color: P.info }, lineStyle: { color: P.info, width: 2 },
-          },
-        ],
-        tooltip: {
-          ...eco().tooltip, trigger: "axis",
-          formatter: (ps) => {
-            const i = ps[0]?.dataIndex ?? 0, r = cur[i] || {};
-            return `${r.provider} · ${r.model}<br>并发 ${r.concurrency} · 通过 ${r.ok}/${r.ok + r.fail}` +
-              `<br>p50 ${r.p50 ?? "—"}ms · p95 ${r.p95 ?? "—"}ms` +
-              `<br>吞吐 ${r.throughput ?? "—"} req/s · 墙钟 ${r.wallMs ?? "—"}ms` +
-              (r.errors?.length ? `<br>错误：${r.errors.join(" | ")}` : "");
-          },
-        },
-      }, true);
-    }
-  }
-  // 3) Token 速率
-  const c3 = ensureChart("chartTps");
-  if (c3 && c3.getDom() && !c3.getDom().dataset.ctxBound) {
-    c3.getDom().dataset.ctxBound = "1";
-    c3.getDom().addEventListener("contextmenu", (e) => chartMenu("chartTps", e));
-  }
-  if (c3) {
-    const rows = (src.rows || []).filter((r) => r.tps != null && r.ok);
-    if (!rows.length) c3.setOption(emptyOption("暂无速率数据"), true);
-    else {
-      const labels = [...new Set(rows.map((r) => `${shortP(r.provider)}·${r.model}`))];
-      const m2 = {};
-      rows.forEach((r) => { const k = `${shortP(r.provider)}·${r.model}`; (m2[k] = m2[k] || []).push(r.tps); });
-      c3.setOption({
-        ...eco(),
-        grid: { left: 46, right: 18, top: 28, bottom: 54 },
-        xAxis: { type: "category", data: labels, axisLabel: { interval: 0, rotate: 22, fontSize: 9 }, axisLine: { lineStyle: { color: P.line } } },
-        yAxis: { type: "value", name: "tok/s", splitLine: { lineStyle: { color: P.grid } } },
-        series: [{ name: "平均速率", type: "bar", data: labels.map((k) => Math.round(avg(m2[k]) * 10) / 10), itemStyle: { color: P.info }, barMaxWidth: 26, borderRadius: [4, 4, 0, 0] }],
-      }, true);
-    }
-  }
-  // 4) 历史通过率
-  const c4 = ensureChart("chartHistory");
-  if (c4 && c4.getDom() && !c4.getDom().dataset.ctxBound) {
-    c4.getDom().dataset.ctxBound = "1";
-    c4.getDom().addEventListener("contextmenu", (e) => chartMenu("chartHistory", e));
-  }
-  if (c4) {
-    const runs = S.runs.slice(0, 30).reverse();
-    if (!runs.length) c4.setOption(emptyOption("暂无历史 · 每次检测完成后自动存档"), true);
-    else {
-      c4.setOption({
-        ...eco(),
-        xAxis: { type: "category", data: runs.map((r) => hhmmss(r.ts).slice(0, 5)), axisLine: { lineStyle: { color: P.line } } },
-        yAxis: { type: "value", max: 100, name: "%", splitLine: { lineStyle: { color: P.grid } } },
-        series: [{
-          name: "通过率", type: "line", smooth: true,
-          data: runs.map((r) => { const t = r.stats.pass + r.stats.fail; return t ? Math.round((r.stats.pass / t) * 100) : 0; }),
-          itemStyle: { color: P.sig }, lineStyle: { color: P.sig, width: 2 },
-          areaStyle: { color: P.sigDim }, symbolSize: 5,
-        }],
-      }, true);
-    }
-  }
-  requestAnimationFrame(() => Object.values(charts).forEach((c) => { try { c.resize(); } catch {} }));
-}
-
-// ---------------- 记录 ----------------
-// 记录页有两个视图：
-//   model（默认）—— 按「端点 × 模型」汇总成一行，直观看出每个模型是「成功 / 部分成功 / 失败」，
-//                    失败原因自动归类（无可用渠道 / 模型已下线 / 超时…），不用再逐条读红字。
-//   case         —— 原来的逐条用例流水，排查单次请求细节时用。
-function renderRecords() {
-  const el = $("#view-records");
-  const baseRows = S.filterRun ? S.filterRun.rows : (S.runs.length && !S.running ? S.runs[0].rows : S.rows);
-  let scoped = S.filterProv ? baseRows.filter((r) => r.provider === S.filterProv) : baseRows;
-
-  const modeTabs = `
-    <div class="chips" style="margin-bottom:10px">
-      <button class="chip ${S.recMode === "model" ? "active" : ""}" data-mode="model">按模型汇总</button>
-      <button class="chip ${S.recMode === "case" ? "active" : ""}" data-mode="case">按用例流水</button>
-      <span class="spacer"></span>
-      ${S.filterProv ? `<button class="chip active" data-f="prov">端点：${esc(S.filterProv)} ✕</button>` : ""}
-      ${S.filterRun ? `<button class="chip" data-f="exit">← 返回本轮</button>` : ""}
-      <button class="chip" data-f="report">导出报告表格</button>
-      <button class="chip" data-f="csv">导出 CSV</button>
-      <button class="chip danger" data-f="clear">清空记录</button>
-    </div>`;
-
-  el.innerHTML = modeTabs + (S.recMode === "model" ? renderRecordsModel(scoped) : renderRecordsCase(scoped, baseRows));
-
-  el.querySelectorAll(".chip[data-mode]").forEach((c) =>
-    c.addEventListener("click", () => { S.recMode = c.dataset.mode; S.filterModel = null; renderRecords(); }));
-  el.querySelectorAll(".chip[data-f]").forEach((c) => c.addEventListener("click", () => onRecordChip(c.dataset.f)));
-  // 模型视图筛选 chip（全部 / 成功 / 部分成功 / 失败）
-  el.querySelectorAll(".chip[data-mf]").forEach((c) =>
-    c.addEventListener("click", () => { S.mfilter = c.dataset.mf; renderRecords(); }));
-  // 用例流水筛选 chip（全部 / 通过 / 失败）
-  el.querySelectorAll(".chip[data-f2]").forEach((c) =>
-    c.addEventListener("click", () => { S.filter = c.dataset.f2; renderRecords(); }));
-  el.querySelector("#recLimit")?.addEventListener("change", async (e) => {
-    S.settings.recordLimit = Math.max(20, Math.min(5000, parseInt(e.target.value, 10) || 300));
-    await storeSave("settings", S.settings);
-    renderRecords();
-  });
-  if (S.recMode === "model") {
-    el.querySelectorAll("tbody tr[data-model]").forEach((tr) => {
-      tr.addEventListener("click", () => { S.filterModel = (S.filterModel === tr.dataset.model && S.filterProv === tr.dataset.prov) ? null : tr.dataset.model; S.filterProv = tr.dataset.prov; renderRecords(); });
-      tr.addEventListener("contextmenu", (e) => modelRowMenu(tr.dataset.prov, tr.dataset.model, e));
-    });
-  } else {
-    el.querySelectorAll("tbody tr[data-idx]").forEach((tr) => {
-      tr.addEventListener("contextmenu", (e) => recordMenu(Number(tr.dataset.idx), e));
-    });
-  }
-}
-
-// 视图一：按「端点 × 模型」汇总
-const MSTATUS = { "成功": "ok", "部分成功": "warn", "失败": "bad", "未测试": "" };
-function renderRecordsModel(scoped) {
-  const groups = aggregateModelResults(scoped.filter((r) => r.model));
-  let list = groups;
-  if (S.mfilter === "ok") list = list.filter((g) => g.stat.status === "成功");
-  if (S.mfilter === "part") list = list.filter((g) => g.stat.status === "部分成功");
-  if (S.mfilter === "fail") list = list.filter((g) => g.stat.status === "失败");
-  // 排序：失败 > 部分成功 > 成功，同级按端点+模型名
-  const order = { "失败": 0, "部分成功": 1, "成功": 2, "未测试": 3 };
-  list = [...list].sort((a, b) => (order[a.stat.status] - order[b.stat.status]) || (a.provider + a.model).localeCompare(b.provider + b.model));
-
-  const cnt = (st) => groups.filter((g) => g.stat.status === st).length;
-  const chips = `
-    <div class="chips">
-      <button class="chip ${S.mfilter === "all" ? "active" : ""}" data-mf="all">全部 ${groups.length}</button>
-      <button class="chip ${S.mfilter === "ok" ? "active" : ""}" data-mf="ok">成功 ${cnt("成功")}</button>
-      <button class="chip ${S.mfilter === "part" ? "active" : ""}" data-mf="part">部分成功 ${cnt("部分成功")}</button>
-      <button class="chip ${S.mfilter === "fail" ? "active" : ""}" data-mf="fail">失败 ${cnt("失败")}</button>
-      <span class="spacer"></span>
-      <span class="hint">点行展开该模型的每条用例</span>
-    </div>`;
-
-  const body = list.length ? `<div class="table-wrap"><table>
-    <thead><tr><th>端点</th><th>模型</th><th>状态</th><th>通过/共</th><th>p50</th><th>p95</th><th>TTFT</th><th>速率</th><th>失败归因</th></tr></thead>
-    <tbody>${list.map((g) => {
-      const st = g.stat;
-      const cls = MSTATUS[st.status] || "";
-      const reason = st.status === "成功" ? "" : classifyFails(g.rows);
-      const open = S.filterModel === g.model && S.filterProv === g.provider;
-      return `<tr data-model="${esc(g.model)}" data-prov="${esc(g.provider)}" class="${open ? "row-open" : ""}" title="点击展开 / 右键更多">
-        <td><b>${esc(g.provider)}</b></td>
-        <td>${esc(g.model)}</td>
-        <td><span class="pill ${cls}">${st.status}</span></td>
-        <td>${st.ok}/${st.total}</td>
-        <td>${st.p50 != null ? st.p50 + "ms" : "—"}</td>
-        <td>${st.p95 != null ? st.p95 + "ms" : "—"}</td>
-        <td>${st.ttft != null ? st.ttft + "ms" : "—"}</td>
-        <td>${st.tps != null ? st.tps + " " + (st.unit || "") : "—"}</td>
-        <td><span class="sub">${esc(reason || "—")}</span></td>
-      </tr>${open ? renderModelDetail(g.rows) : ""}`;
-    }).join("")}</tbody>
-  </table></div>` : `<div class="empty">${scoped.length ? "没有匹配的模型" : "还没有记录 · 点左侧「快速检测」开跑"}</div>`;
-
-  return chips + body;
-}
-
-// 展开某模型时，把它的每条用例作为子行铺开
-function renderModelDetail(rows) {
-  return `<tr class="detail-row"><td colspan="9"><div class="detail-box">
-    ${rows.map((r) => `<div class="detail-line">
-      <span class="pill ${r.ok ? "ok" : "bad"}">${r.ok ? "通过" : "失败"}</span>
-      <span class="dk">${KINDS[r.kind] || esc(r.kind || "")}${r.agg ? " 聚合" : ""}</span>
-      <span class="dt">${hhmmss(r.t || Date.now())}</span>
-      <span class="dl">${r.agg || r.kind === "concur" ? (r.p50 != null ? `p50 ${r.p50}/p95 ${r.p95}` : "—") : (r.latencyMs != null ? r.latencyMs + "ms" : "—")}</span>
-      <span class="dd">${esc(r.error || r.preview || "")}</span>
-    </div>`).join("")}
-  </div></td></tr>`;
-}
-
-// 视图二：逐条用例流水（保留原行为）
-function renderRecordsCase(scoped, baseRows) {
-  let rows = scoped;
-  if (S.filter === "pass") rows = rows.filter((r) => r.ok);
-  if (S.filter === "fail") rows = rows.filter((r) => !r.ok);
-  const limit = Math.max(20, Math.min(5000, parseInt(S.settings.recordLimit, 10) || 300));
-  const shown = rows.slice(-limit);
-  S._shownRows = shown;
-
-  const chips = `
-    <div class="chips">
-      <button class="chip ${S.filter === "all" ? "active" : ""}" data-f2="all">全部 ${scoped.length}</button>
-      <button class="chip ${S.filter === "pass" ? "active" : ""}" data-f2="pass">通过 ${scoped.filter((r) => r.ok).length}</button>
-      <button class="chip ${S.filter === "fail" ? "active" : ""}" data-f2="fail">失败 ${scoped.filter((r) => !r.ok).length}</button>
-      <span class="spacer"></span>
-      ${rows.length > shown.length ? `<span class="hint">显示最近 ${shown.length} / ${rows.length} 条</span>` : ""}
-      <label class="chip select-chip" title="最多显示多少条记录">
-        显示
-        <select id="recLimit">
-          ${[100, 300, 500, 1000, 2000].map((n) => `<option value="${n}" ${limit === n ? "selected" : ""}>${n}</option>`).join("")}
-        </select>
-        条
-      </label>
-    </div>`;
-
-  const body = shown.length ? `<div class="table-wrap"><table>
-    <thead><tr><th>时间</th><th>端点</th><th>测试</th><th>模型</th><th>结果</th><th>延迟</th><th>TTFT</th><th>速率</th><th>详情</th></tr></thead>
-    <tbody>${shown.map((r, i) => `
-      <tr data-idx="${i}" title="右键：复制 / 只看此端点 / 导出报告">
-        <td>${hhmmss(r.t || Date.now())}</td>
-        <td><b>${esc(r.provider || "")}</b></td>
-        <td>${KINDS[r.kind] || esc(r.kind || "")}${r.agg ? "<span class='sub'> 聚合</span>" : ""}</td>
-        <td>${esc(r.model || "—")}</td>
-        <td><span class="pill ${r.ok ? "ok" : "bad"}">${r.ok ? "通过" : "失败"}</span></td>
-        <td>${r.agg || r.kind === "concur" ? (r.p50 != null ? `p50 ${r.p50} / p95 ${r.p95}` : "—") : (r.latencyMs != null ? r.latencyMs + "ms" : "—")}</td>
-        <td>${r.ttftMs != null ? r.ttftMs + "ms" : "—"}</td>
-        <td>${r.tps != null ? r.tps + " " + (r.unit || "") : "—"}</td>
-        <td><span class="sub">${esc((r.error || r.preview || "").slice(0, 60))}</span></td>
-      </tr>`).join("")}</tbody>
-  </table></div>` : `<div class="empty">还没有记录 · 点左侧「快速检测」开跑</div>`;
-
-  return chips + body;
-}
-
-// 清空记录：可选只清当前轮 / 连历史一起清
-function clearRecords() {
-  const inRun = !!S.filterRun;
-  const scope = inRun ? "当前浏览的这一轮" : "最新一轮记录";
-  if (!confirm(`清空${scope}？\n\n（只清测试记录，端点和参数不动）`)) return;
-  if (inRun) {
-    const r = S.runs.find((x) => x.ts === S.filterRun.ts);
-    if (r) { r.rows = []; r.concur = []; r.stats = { pass: 0, fail: 0 }; r.providerCount = 0; }
-    S.filterRun = null;
-  } else {
-    S.rows = [];
-    if (S.activeRun) S.activeRun.rows = [];
-    if (S.runs.length) {
-      S.runs[0].rows = [];
-      S.runs[0].concur = [];
-      S.runs[0].stats = { pass: 0, fail: 0 };
-      S.runs[0].providerCount = 0;
-    }
-  }
-  S.filterProv = null;
-  S.filter = "all";
-  storeSave("history", S.runs);
-  renderAll();
-  toast("记录已清空", "ok");
-}
-function clearAllHistory() {
-  if (!confirm("清空全部历史（所有轮次的记录）？此操作不可撤销。")) return;
-  S.runs = [];
-  S.rows = [];
-  S.filterRun = null;
-  S.filterProv = null;
-  storeSave("history", S.runs);
-  renderAll();
-  toast("全部历史已清空", "ok");
-}
-
-function onRecordChip(f) {
-  if (f === "csv") return exportCsv();
-  if (f === "report") return exportReportCsv(S.filterRun || null);
-  if (f === "clear") return clearRecords();
-  if (f === "prov") { S.filterProv = null; renderRecords(); return; }
-  if (f === "exit") { S.filterRun = null; S.filterProv = null; renderRecords(); return; }
-  S.filter = f;
-  renderRecords();
-}
-
-function exportCsv() {
-  const runRows = S.filterRun ? S.filterRun.rows : (S.runs[0]?.rows || S.rows);
-  const baseRows = S.filterProv ? runRows.filter((r) => r.provider === S.filterProv) : runRows;
-  const prov = (name) => S.providers.find((p) => p.name === name) || {};
-  const head = "时间,端点,类型,API地址,APIKey,模型,测试,结果,延迟ms,TTFTms,tokens,速率,单位,详情";
-  const lines = baseRows.map((r) => {
-    const p = prov(r.provider);
-    return csvRow([
-      new Date(r.t || Date.now()).toLocaleString("zh-CN", { hour12: false }),
-      r.provider || "", TYPE_LABEL[r.type || p.type] || r.type || p.type || "",
-      p.baseUrl || r.baseUrl || "", p.apiKey || "",
-      r.model || "",
-      (KINDS[r.kind] || r.kind || "") + (r.agg ? " 聚合" : ""), r.ok ? "通过" : "失败",
-      r.agg || r.kind === "concur" ? (r.p50 != null ? `p50 ${r.p50} / p95 ${r.p95}` : "") : (r.latencyMs ?? ""),
-      r.ttftMs ?? "", r.tokens ?? "", r.tps ?? "", r.unit ?? "",
-      r.error || r.preview || "",
-    ]);
-  });
-  const csv = "\ufeff" + [head, ...lines].join("\r\n");
-  const name = `export-${stampName()}.csv`;
-  saveFile(name, csv);
-}
-
-// ---------------- 历史 ----------------
-function renderHistory() {
-  const el = $("#view-history");
-  if (!S.runs.length) {
-    el.innerHTML = `<div class="empty">暂无历史 · 每次检测完成后自动存档</div>`;
-    return;
-  }
-  const totalRows = S.runs.reduce((s, r) => s + r.rows.length, 0);
-  el.innerHTML = `
-  <div class="chips" style="margin-bottom:12px">
-    <span class="hint">共 ${S.runs.length} 轮 · ${totalRows} 条记录</span>
-    <span class="spacer"></span>
-    <button class="chip" data-act="report">导出最近一轮报告</button>
-    <button class="chip danger" data-act="clearAll">清空全部历史</button>
-  </div>
-  <div class="table-wrap"><table>
-    <thead><tr><th>时间</th><th>端点</th><th>模型</th><th>用例</th><th>通过</th><th>部分</th><th>失败</th><th>耗时</th><th>p50</th><th>失败主因</th><th></th></tr></thead>
-    <tbody>${S.runs.map((r) => {
-      const lat = r.rows.filter((x) => x.ok && !x.agg).map((x) => x.latencyMs);
-      // 模型级健康度：把本轮按「端点×模型」聚合，数出成功 / 部分成功 / 失败三态
-      const groups = aggregateModelResults(r.rows.filter((x) => x.model));
-      const part = groups.filter((g) => g.stat.status === "部分成功").length;
-      const badModels = groups.filter((g) => g.stat.status === "失败").length;
-      const cause = classifyFails(r.rows);
-      return `<tr data-ts="${r.ts}" title="右键：查看 / 导出报告 / 删除">
-        <td>${new Date(r.ts).toLocaleString("zh-CN", { hour12: false })}</td>
-        <td><b>${r.providerCount}</b></td>
-        <td>${groups.length}</td>
-        <td>${r.rows.length}</td>
-        <td><span class="pill ok">${r.stats.pass}</span></td>
-        <td>${part ? `<span class="pill warn">${part}</span>` : "—"}</td>
-        <td><span class="pill ${r.stats.fail ? "bad" : ""}">${r.stats.fail}</span>${badModels ? `<span class="sub"> ${badModels}模型</span>` : ""}</td>
-        <td>${(r.durationMs / 1000).toFixed(1)}s</td>
-        <td>${lat.length ? pct(lat, 0.5) + "ms" : "—"}</td>
-        <td><span class="sub">${esc(cause || "—")}</span></td>
-        <td><button class="btn tiny" data-act="view">查看</button>
-            <button class="btn tiny" data-act="report">导出报告</button>
-            <button class="btn tiny" data-act="del">删除</button></td>
-      </tr>`;
-    }).join("")}</tbody></table></div>`;
-  el.querySelectorAll("tbody tr").forEach((tr) => {
-    const ts = Number(tr.dataset.ts);
-    tr.addEventListener("contextmenu", (e) => historyMenu(ts, e));
-    tr.querySelector('[data-act="view"]')?.addEventListener("click", () => window.AH.viewRun(ts));
-    tr.querySelector('[data-act="report"]')?.addEventListener("click", () => exportReportCsv(S.runs.find((x) => x.ts === ts)));
-    tr.querySelector('[data-act="del"]')?.addEventListener("click", () => window.AH.delRun(ts));
-  });
-  el.querySelector('.chip[data-act="clearAll"]')?.addEventListener("click", clearAllHistory);
-  el.querySelector('.chip[data-act="report"]:not([data-ts])')?.addEventListener("click", () => exportReportCsv(S.runs[0]));
-}
-
-// ---------------- 配置页 ----------------
-function renderConfig() {
-  const el = $("#view-config");
-  const s = S.settings;
-  el.innerHTML = `
-  <div class="cfg-sec">
-    <h3>外观</h3>
-    <div class="theme-row">
-      ${[["auto", "◐ 跟随系统"], ["light", "☀ 浅色"], ["dark", "☾ 深色"]].map(([m, lb]) =>
-        `<button class="chip ${(S.settings.theme || "auto") === m ? "active" : ""}" onclick="AH.setTheme('${m}')">${lb}</button>`).join("")}
-    </div>
-    <div class="hint" style="margin-top:12px">当前生效：${effectiveTheme() === "dark" ? "深色 · 监护室夜间" : "浅色 · 临床白昼"}。选「跟随系统」会随 Windows 深色/浅色设置自动切换。</div>
-  </div>
-
-  <div class="cfg-sec">
-      <h3>测试参数</h3>
-      <div class="grid2">
-        <div class="field"><label>请求超时（ms）</label><input id="cfg_timeout" value="${s.timeoutMs}"></div>
-        <div class="field"><label>连通超时（ms）</label><input id="cfg_ctimeout" value="${s.connectTimeoutMs}"></div>
-        <div class="field"><label>延迟采样次数</label><input id="cfg_latn" value="${s.latencyN}"></div>
-        <div class="field"><label>并发数（2-64，1 无效）</label><input id="cfg_concur" value="${s.concurN ?? 4}"></div>
-        <div class="field"><label>失败自动重试次数（0-3）</label><input id="cfg_retries" value="${s.retries ?? 1}"></div>
-        <div class="field"><label>用例间隔（ms）</label><input id="cfg_gap" value="${s.gapMs}"></div>
-      </div>
-      <div class="hint" style="margin-bottom:8px">并发数必须 ≥2 才有意义（=1 等同于普通串行请求）；只对 5xx/429/超时/空响应等可恢复失败重试，关键词不符属模型真实答案，不重试。</div>
-      <div class="field switch-field" style="margin-top:8px">
-        <label class="switch"><input type="checkbox" id="cfg_concur_on" ${s.tests.concur ? "checked" : ""} onchange="AH.toggleConcur(this.checked)"><span class="track"></span><span>并发开关：检测时按并发数并行发起请求</span></label>
-      </div>
-      <button class="btn primary" onclick="AH.saveSettings()">保存参数</button>
-    </div>
-
-    <div class="cfg-sec">
-      <h3>端点（${S.providers.length}）</h3>
-      ${S.providers.length ? `<div class="table-wrap"><table><thead><tr><th>名称</th><th>类型</th><th>BaseURL</th><th>测试模型</th><th>状态</th><th></th></tr></thead>
-        <tbody>${S.providers.map((p) => `<tr data-id="${p.id}" title="右键：复制 / 获取模型 / 删除">
-          <td><b>${esc(p.name)}</b></td>
-          <td>${TYPE_LABEL[p.type] || p.type}</td>
-          <td><span class="sub">${esc(p.baseUrl)}</span></td>
-          <td><span class="sub">${(p.selModels || []).length ? (p.selModels || []).length + " 个" : "自动前 2"}</span></td>
-          <td><span class="pill ${p.enabled === false ? "" : "ok"}">${p.enabled === false ? "停用" : "启用"}</span></td>
-          <td><button class="btn tiny" data-act="edit">编辑</button>
-              <button class="btn tiny" data-act="fetch">获取模型</button>
-              <button class="btn tiny" data-act="del">删除</button></td>
-        </tr>`).join("")}</tbody></table></div>` : `<div class="empty">暂无端点</div>`}
-      <div class="btn-row" style="margin-top:10px">
-        <button class="btn" onclick="AH.addProv()">添加端点</button>
-        <button class="btn" onclick="AH.importModal()">批量导入</button>
-      </div>
-    </div>
-
-  <div class="cfg-sec">
-    <h3>提示词（${S.prompts.length}）</h3>
-    <div class="table-wrap"><table><thead><tr><th>标签</th><th>内容</th><th>期望</th><th></th></tr></thead>
-      <tbody>${S.prompts.map((p, i) => `<tr>
-        <td><b>${esc(p.label)}</b></td>
-        <td><span class="sub">${esc(p.user.slice(0, 40))}…</span></td>
-        <td>${esc(p.expect || "—")}</td>
-        <td><button class="btn tiny" onclick="AH.delPrompt(${i})">删除</button></td>
-      </tr>`).join("")}</tbody></table></div>
-    <div class="grid2" style="margin-top:10px">
-      <div class="field"><label>标签</label><input id="np_label" placeholder="例如：数学计算"></div>
-      <div class="field"><label>期望关键词（可空）</label><input id="np_expect" placeholder="例如：436"></div>
-    </div>
-    <div class="field"><label>提示词内容</label><textarea id="np_user" placeholder="发给模型的问题"></textarea></div>
-    <button class="btn" onclick="AH.addPrompt()">添加提示词</button>
-  </div>
-
-  <div class="cfg-sec">
-    <h3>数据</h3>
-    <div class="btn-row">
-      <button class="btn" onclick="AH.openDir()">打开数据目录</button>
-      <button class="btn" onclick="AH.exportConfig()">导出配置 JSON</button>
-      <button class="btn danger" onclick="AH.clearHistory()">清空历史</button>
-    </div>
-    <div class="field" style="margin-top:12px"><label>导入配置（粘贴 JSON）</label><textarea id="cfg_import" placeholder='{"providers":[...],"settings":{...},"prompts":[...]}'></textarea></div>
-    <button class="btn" onclick="AH.importConfig()">导入配置</button>
-  </div>`;
-  el.querySelectorAll("#view-config tr[data-id]").forEach((tr) => {
-    const id = tr.dataset.id;
-    tr.addEventListener("contextmenu", (e) => providerMenu(id, e));
-    tr.querySelector('[data-act="edit"]')?.addEventListener("click", () => editProvider(id));
-    tr.querySelector('[data-act="fetch"]')?.addEventListener("click", () => fetchModelsFor(id, true));
-    tr.querySelector('[data-act="del"]')?.addEventListener("click", () => delProv(id));
-  });
-}
-
-// ---------------- 检测编排 ----------------
-function pickModels(p) {
-  if (p.selModels && p.selModels.length) return p.selModels;
-  if (p.models && p.models.length) return p.models.slice(0, 2);
-  return [];
-}
-function pushRow(row) {
-  const r = { ...row };
-  delete r.content;
-  S.rows.push(r);
-  if (S.activeRun) S.activeRun.rows.push(r);
-  if (S.tab === "records" || S.tab === "dash") { renderRecords(); }
-  renderHud();
-}
-
-// 失败归因：把一条错误信息归到「主因」类别，供记录/历史/摘要复用。
-// 顺序敏感：先匹配最具体的真实上游话术（渠道不存在 / 模型下线 / 额度），再落到通用类别。
-function failClass(err) {
-  const s = String(err || "");
-  if (!s) return "";
-  if (/end of life|no longer available|已下线|下线|已停用|已弃用|deprecat/i.test(s)) return "模型已下线";
-  if (/可用渠道不存在|no available channel|no channel|渠道不存在|无可用渠道|无可用/i.test(s)) return "无可用渠道";
-  if (/usage limit|额度|quota|欠费|余额|insufficient|balance|超出限额/i.test(s)) return "额度/欠费";
-  if (/缺少关键词|不符|关键词/.test(s)) return "回答不符预期";
-  if (/空内容|空响应|empty/i.test(s)) return "空响应";
-  if (/超时|timeout|timed out/i.test(s)) return "超时";
-  if (/\b429\b|rate limit|限流|too many/i.test(s)) return "限流(429)";
-  if (/\b5\d\d\b|internal server|bad gateway|unavailable|上游/i.test(s)) return "上游5xx";
-  if (/\b40[13]\b|unauthor|forbidden|鉴权|invalid api key|api key|apikey|令牌|token/i.test(s)) return "鉴权/Key";
-  if (/\b404\b|not found|不存在的模型|model.*not.*exist/i.test(s)) return "模型不存在";
-  if (/已取消|abort|cancel/i.test(s)) return "已取消";
-  if (/非 JSON|non-json|解析|parse|结构非标准/i.test(s)) return "响应异常";
-  return "其他";
-}
-
-// 一组失败行 → 归类计数串，例如「无可用渠道 ×2 · 超时 ×1」
-// 跳过聚合行（延迟/并发的 agg 是对其它行的汇总，计进来会重复且产生「N/N 失败」噪音）
-function classifyFails(rows) {
-  const fails = rows.filter((r) => !r.ok && !r.agg);
-  if (!fails.length) return "";
-  const by = new Map();
-  for (const r of fails) {
-    const k = failClass(r.error || r.preview || "失败") || "其他";
-    by.set(k, (by.get(k) || 0) + 1);
-  }
-  return [...by.entries()]
-    .sort((a, b) => b[1] - a[1])
-    .map(([k, n]) => `${k}${n > 1 ? " ×" + n : ""}`)
-    .join(" · ");
-}
-
-// 失败归因：把失败按「主因」聚成一句结论，避免只看一堆红字不知道问题在哪
-function summarizeFailures(rows) {
-  const fails = rows.filter((r) => !r.ok);
-  if (!fails.length) return "";
-  const by = new Map();
-  const aff = new Map();  // 受影响的模型
-  for (const r of fails) {
-    const k = failClass(r.error || r.preview || "失败") || "其他";
-    by.set(k, (by.get(k) || 0) + 1);
-    if (!aff.has(k)) aff.set(k, new Set());
-    if (r.model) aff.get(k).add(r.model);
-  }
-  return [...by.entries()]
-    .sort((a, b) => b[1] - a[1])
-    .map(([k, n]) => `${k} ${n}（${[...(aff.get(k) || [])].slice(0, 2).join(", ")}${(aff.get(k)?.size || 0) > 2 ? " 等" + aff.get(k).size + " 个模型" : ""}）`)
-    .join(" · ");
-}
-
-// 模型名缩写（端点卡上的阶段文字用）
-const shortModel = (m) => {
-  const t = String(m || "");
-  return t.length > 18 ? t.slice(0, 17) + "…" : t;
-};
-
-function setRunUI(on) {
-  S.running = on;
-  $("#btnRunQuick").disabled = on;
-  $("#btnRunFull").disabled = on;
-  $("#btnStop").disabled = !on;
-}
-
-// ---- 开跑前预估：用例数 / 预计耗时，长跑先确认 ----
-function buildPlan(targets, full) {
-  const t = S.settings.tests;
-  const useConcur = !!full || !!t.concur;
-  const concurN = Math.max(1, Math.min(64, parseInt(S.settings.concurN, 10) || 4));
-  // 每个模型的单次用例数（连通对端点只算一次，这里按模型计其余项）
-  let perModel = 0;
-  if (t.latency) perModel += (S.settings.latencyN || 3) * (1 + (S.settings.retries || 0) * 0.3);
-  if (t.stream) perModel += 1.2;
-  if (t.tps) perModel += 1.2;
-  if (useConcur) perModel += concurN * 1.2;
-  let total = 0, modelCount = 0;
-  for (const p of targets) {
-    total += 1;                                  // 连通
-    if (p.type === "custom") continue;
-    const n = (p.selModels?.length || (p.models?.length ? Math.min(2, p.models.length) : 0));
-    modelCount += n;
-    total += n * perModel;
-  }
-  total = Math.round(total);
-  // 单请求按 1.8s 估（真实数据里 p50 约 1.5–5.9s，取偏乐观值）
-  const secs = Math.max(1, Math.round(total * 1.8 + targets.length * 0.6));
-  const estText = secs < 60 ? `${secs}s` : `${(secs / 60).toFixed(1)} 分钟`;
-  return {
-    total, modelCount, useConcur, concurN,
-    estSecs: secs, estText,
-    // 超过 3 分钟就算长跑，先让用户确认
-    longRun: secs > 180,
-  };
-}
-
-async function runBattery(full, onlyIds) {
-  if (S.running) return;
-  const only = Array.isArray(onlyIds) && onlyIds.length ? onlyIds : null;
-  const targets = S.providers.filter((p) => p.enabled !== false && (!only || only.includes(p.id)));
-  if (!targets.length) { toast("没有启用的端点，先添加或导入", "bad"); return; }
-
-  // ---- 开跑前预检：这些问题不该等到跑完才发现 ----
-  const plan = buildPlan(targets, full);
-  if (!plan.total) { toast("没有可测的模型：请先在端点里「获取模型」或指定测试模型", "bad"); return; }
-  if (plan.longRun) {
-    const go = confirm(
-      `本次预计执行 ${plan.total} 个用例、约 ${plan.estText}。\n\n` +
-      `端点 ${targets.length} · 模型 ${plan.modelCount} · 并发 ${plan.useConcur ? plan.concurN : "关"}\n\n继续？`
-    );
-    if (!go) return;
-  }
-
-  S.rows = [];
-  S.filterRun = null;
-  S.activeRun = { ts: Date.now(), rows: [], concur: [] };
-  S.abort = new AbortController();
-  S.doneIds = new Set();
-  S.runCursor = null;
-  setRunUI(true);
-  ecgState("busy");
-  setStatus("检测开始…");
-  const retries = Math.max(0, Math.min(3, parseInt(S.settings.retries, 10) || 0));
-  // 阶段提示：同时写状态栏与端点卡「正在测试」文字
-  const phase = (p, text) => { setStatus(`检测 ${p.name} · ${text}`); setProvPhase(text); };
-  let retryCount = 0;
-  const useConcur = !!full || !!S.settings.tests.concur;
-  const concurN = () => Math.max(1, Math.min(64, parseInt(S.settings.concurN, 10) || 4));
-
-  try {
-    for (const p of targets) {
-      if (!S.running) break;
-      markProvTesting(p.id, "连通性检测");
-      setProgress("");
-      if (S.settings.tests.connect) {
-        const c = await opConnectivity(p, { timeoutMs: S.settings.connectTimeoutMs, signal: S.abort.signal });
-        pushRow(c);
-        if (p.type !== "custom" && c.ok && c.models?.length) { p.models = c.models; await storeSave("providers", S.providers); renderProviders(); }
-      }
-      if (p.type === "custom") { markProvDone(p.id); continue; }
-
-      let models = pickModels(p);
-      if (!models.length) {
-        phase(p, "拉取模型");
-        try {
-          const ms = await listModels(p, { timeoutMs: S.settings.connectTimeoutMs, signal: S.abort.signal });
-          p.models = ms;
-          await storeSave("providers", S.providers);
-          renderProviders();
-          models = ms.slice(0, 2);
-        } catch (e) {
-          pushRow({ provider: p.name, kind: "connect", ok: false, status: 0, error: "模型列表拉取失败：" + e.message, latencyMs: 0, t: Date.now(), preview: "" });
-          markProvDone(p.id);
-          continue;
-        }
-      }
-
-      let mi = 0;
-      for (const model of models) {
-        if (!S.running) break;
-        setProvPhase(`${shortModel(model)} 测试中`);
-        const prompt = S.prompts[mi++ % S.prompts.length];
-        if (S.settings.tests.latency) {
-          phase(p, `${shortModel(model)} · 延迟×${S.settings.latencyN}`);
-          const agg = await opLatency(p, model, prompt, {
-            n: S.settings.latencyN, timeoutMs: S.settings.timeoutMs, signal: S.abort.signal,
-            retries,
-            onRow: (r) => { if (r.retried) retryCount++; pushRow({ ...r, kind: "chat" }); },
-          });
-          pushRow({
-            provider: p.name, model, kind: "latency", agg: true,
-            ok: agg.samples > 0 && agg.ok === agg.samples,
-            p50: agg.p50, p95: agg.p95, latencyMs: agg.p50 ?? 0,
-            error: agg.ok === agg.samples ? "" : `${agg.samples - agg.ok}/${agg.samples} 失败`,
-            tokens: null, chars: 0, t: Date.now(), preview: `n=${agg.samples}`,
-          });
-        }
-        if (S.settings.tests.stream) {
-          phase(p, `${shortModel(model)} · 流式`);
-          let liveChars = 0;
-          const r = await opChatRetry(p, model, prompt, {
-            stream: true, timeoutMs: S.settings.timeoutMs, signal: S.abort.signal, retries,
-            onDelta: (d) => { liveChars += d.length; setProgress(`流式接收 ${liveChars} 字`); },
-          });
-          if (r.retried) retryCount++;
-          pushRow(r);
-          setProgress("");
-        }
-        if (S.settings.tests.tps) {
-          phase(p, `${shortModel(model)} · Token 速率`);
-          const r = await opChatRetry(p, model, prompt, { kind: "tps", timeoutMs: S.settings.timeoutMs, signal: S.abort.signal, retries });
-          if (r.retried) retryCount++;
-          pushRow(r);
-        }
-        if (useConcur) {
-          const n = concurN();
-          phase(p, `${shortModel(model)} · 并发×${n}`);
-          const t0c = Date.now();
-          const res = await opConcurrent(p, model, S.prompts, {
-            n, timeoutMs: S.settings.timeoutMs, signal: S.abort.signal,
-            onProgress: (ev) => {
-              const el = (Date.now() - t0c) / 1000;
-              setProgress(`并发 ${n} — ${ev.finished}/${ev.total} · 已 ${el.toFixed(0)}s`);
-            },
-          });
-          S.activeRun.concur.push(res);
-          const v = concurrencyVerdict(res);
-          pushRow({
-            provider: p.name, model, kind: "concur", agg: true,
-            ok: !!v?.supported,
-            p50: res.p50, p95: res.p95, latencyMs: res.p50 ?? 0,
-            t: Date.now(),
-            error: v?.supported ? "" : `${res.fail}/${res.ok + res.fail} 失败：${res.errors.join(" | ")}`,
-            preview: `并发 ${res.concurrency} · 通过 ${res.ok}/${res.ok + res.fail} · ${
-              res.throughput != null ? res.throughput + " req/s" : "—"} · 墙钟 ${res.wallMs}ms`,
-          });
-          setProgress("");
-        }
-        if (S.settings.gapMs) await sleep(S.settings.gapMs);
-      }
-      markProvDone(p.id);
-    }
-  } catch (e) {
-    toast("检测异常：" + e.message, "bad");
-    setStatus("异常：" + e.message);
-  }
-
-  // 收尾
-  S.running = false;
-  S.runCursor = null;
-  if (S.doneIds) S.doneIds.clear();
-  setRunUI(false);
-  renderProviders();
-  renderVitals();
-  setProgress("");
-  const rows = S.activeRun.rows;
-  const stats = { pass: rows.filter((r) => r.ok).length, fail: rows.filter((r) => !r.ok).length };
-  const rec = {
-    ts: S.activeRun.ts, durationMs: Date.now() - S.activeRun.ts,
-    providerCount: targets.length, stats, rows, concur: S.activeRun.concur,
-    retries: retryCount, interrupted: S.abort.signal.aborted,
-  };
-  const interrupted = S.abort.signal.aborted;
-  S.activeRun = null;
-  if (rows.length) {
-    S.runs.unshift(rec);
-    if (S.runs.length > 100) S.runs.length = 100;
-    await storeSave("history", S.runs);
-  }
-  ecgState(!rows.length ? "idle" : stats.fail === 0 ? "ok" : stats.pass === 0 ? "bad" : "busy");
-  setStatus(
-    `${interrupted ? "已停止" : "完成"} · 通过 ${stats.pass} · 失败 ${stats.fail}` +
-    `${retryCount ? ` · 重试 ${retryCount}` : ""} · ${(rec.durationMs / 1000).toFixed(1)}s`
-  );
-  if (rows.length) {
-    const summary = summarizeFailures(rows);
-    toast(
-      `检测完成：${stats.pass} 通过 / ${stats.fail} 失败${retryCount ? `（自动重试 ${retryCount} 次）` : ""}` +
-      (summary ? `\n主因：${summary}` : ""),
-      stats.fail ? "bad" : "ok"
-    );
-  }
-  renderAll();
-}
-
-function stopRun() {
-  if (!S.running) return;
-  S.running = false;
-  try { S.abort.abort(); } catch {}
-  setStatus("正在停止…");
-}
-
-// ---------------- 渲染汇总 ----------------
-function renderAll() {
-  renderHud();
-  renderProviders();
-  renderVitals();
-  renderRecords();
-  renderHistory();
-  renderConfig();
-  if (S.tab === "dash") renderCharts();
-}
-
-// ---------------- 端点编辑 ----------------
-// 模型选择器状态：已选集合（拉取到的模型勾选）+ 手写补充
-const SEL = { set: new Set(), extra: "" };
-
-function providerForm(p) {
-  const pulled = [...new Set(p.models || [])].sort();
-  const sel = new Set(p.selModels || []);
-  const extra = (p.selModels || []).filter((m) => !pulled.includes(m));
-  SEL.set = new Set([...sel].filter((m) => pulled.includes(m)));
-  SEL.extra = extra.join("\n");
-  return `
-    <div class="grid2">
-      <div class="field"><label>名称</label><input id="f_name" value="${esc(p.name || "")}" placeholder="例如：主力中转·A"></div>
-      <div class="field"><label>协议类型</label><select id="f_type">
-        ${TYPES.map((t) => `<option value="${t.value}" ${p.type === t.value ? "selected" : ""}>${t.label}</option>`).join("")}
-      </select></div>
-    </div>
-
-    <div class="field">
-      <label>BaseURL</label>
-      <div class="row-inline">
-        <input id="f_base" value="${esc(p.baseUrl || "")}" placeholder="https://host/v1">
-        <button class="btn tiny" id="f_fetch" type="button">获取模型</button>
-      </div>
-      <div class="hint">填中转/官方地址即可，只写域名会自动补 <b>/v1</b>；粘错成 <b>/chat/completions</b> 也会自动纠正。</div>
-    </div>
-
-    <div class="field">
-      <label>API Key</label>
-      <div class="row-inline">
-        <input id="f_key" type="password" value="${esc(p.apiKey || "")}" placeholder="sk-...">
-        <button class="btn tiny" id="f_eye" type="button">显示</button>
-        <button class="btn tiny" id="f_clip" type="button">识别剪贴板</button>
-      </div>
-    </div>
-
-    <div class="field switch-field">
-      <label class="switch"><input type="checkbox" id="f_enabled" ${p.enabled !== false ? "checked" : ""}><span class="track"></span><span>启用该端点（参与检测）</span></label>
-    </div>
-
-    <div class="field">
-      <div class="model-head">
-        <label style="margin:0">测试模型 <span class="count-pill" id="f_selcount">0</span></label>
-        <span class="btn-row">
-          <button class="btn tiny" id="f_all" type="button">全选</button>
-          <button class="btn tiny" id="f_none" type="button">清空</button>
-        </span>
-      </div>
-      <input id="f_search" class="model-search" placeholder="搜索模型…" ${pulled.length ? "" : "disabled"}>
-      <div class="model-list" id="f_modellist">
-        ${pulled.length
-          ? pulled.map((m) => `<label class="model-row" data-m="${esc(m.toLowerCase())}">
-              <input type="checkbox" data-model="${esc(m)}" ${SEL.set.has(m) ? "checked" : ""}>
-              <span class="mn">${esc(m)}</span></label>`).join("")
-          : `<div class="empty-sm">还没拉取到模型 · 点上方「获取模型」</div>`}
-      </div>
-      <label class="hint" style="margin-top:10px;display:block">手动补充模型（每行一个，拉取不到的可以手填）</label>
-      <textarea id="f_selmodels" style="min-height:64px">${esc(extra.join("\n"))}</textarea>
-      <div class="hint">不勾不填 = 检测时自动取前 2 个模型。</div>
-    </div>`;
-}
-
-// 从表单读连接参数（不落库），供「获取模型」用当前输入直接探测
-function readFormConn() {
-  const type = $("#f_type")?.value || "openai";
-  const raw = ($("#f_base")?.value || "").trim();
-  return { type, baseUrl: raw ? normalizeBase(raw, type) : "", apiKey: ($("#f_key")?.value || "").trim() };
-}
-function refreshSelCount() {
-  const n = SEL.set.size + SEL.extra.split(/\r?\n/).map((s) => s.trim()).filter(Boolean).length;
-  const el = $("#f_selcount");
-  if (el) el.textContent = n;
-}
-function bindModelList() {
-  const list = $("#f_modellist");
-  if (!list) return;
-  list.querySelectorAll("input[data-model]").forEach((cb) => {
-    cb.addEventListener("change", () => {
-      if (cb.checked) SEL.set.add(cb.dataset.model);
-      else SEL.set.delete(cb.dataset.model);
-      refreshSelCount();
-    });
-  });
-  refreshSelCount();
-}
-function applyModelSearch(q) {
-  const kw = String(q || "").trim().toLowerCase();
-  $("#f_modellist")?.querySelectorAll(".model-row").forEach((row) => {
-    row.classList.toggle("hidden", !!kw && !row.dataset.m.includes(kw));
-  });
-}
-function renderFormModels(models) {
-  const list = [...new Set(models)].sort();
-  const box = $("#f_modellist");
-  if (box) {
-    box.innerHTML = list.length
-      ? list.map((m) => `<label class="model-row" data-m="${esc(m.toLowerCase())}">
-          <input type="checkbox" data-model="${esc(m)}" ${SEL.set.has(m) ? "checked" : ""}>
-          <span class="mn">${esc(m)}</span></label>`).join("")
-      : `<div class="empty-sm">该端点没有返回任何模型</div>`;
-  }
-  const s = $("#f_search");
-  if (s) s.disabled = !list.length;
-  bindModelList();
-  applyModelSearch($("#f_search")?.value);
-}
-async function fetchModelsFromForm() {
-  const btn = $("#f_fetch");
-  const p = S.providers.find((x) => x.id === (S._editingId || ""));
-  const conn = readFormConn();
-  if (!conn.baseUrl) { toast("先填 BaseURL", "bad"); return; }
-  if (btn) { btn.disabled = true; btn.textContent = "获取中…"; }
-  try {
-    const models = await listModels(conn, { timeoutMs: S.settings.connectTimeoutMs });
-    renderFormModels(models);
-    if (p) { p.models = models; await storeSave("providers", S.providers); renderProviders(); }
-    toast(`获取到 ${models.length} 个模型`, "ok");
-  } catch (e) {
-    toast("获取失败：" + e.message, "bad");
-  } finally {
-    if (btn) { btn.disabled = false; btn.textContent = "获取模型"; }
-  }
-}
-function selectAllFormModels(on) {
-  if (on) {
-    const all = [...new Set(S.providers.find((x) => x.id === (S._editingId || ""))?.models || [])];
-    if (!all.length) { toast("还没有模型列表，先点「获取模型」", "bad"); return; }
-    SEL.set = new Set(all);
-  } else SEL.set = new Set();
-  $("#f_modellist")?.querySelectorAll("input[data-model]").forEach((cb) => { cb.checked = on; });
-  refreshSelCount();
-}
-function collectSelModels() {
-  const checked = [...SEL.set];
-  const extra = ($("#f_selmodels")?.value || "").split(/\r?\n/).map((s) => s.trim()).filter(Boolean);
-  return [...new Set([...checked, ...extra])];
-}
-
-// 右键菜单：拉取模型列表（异步刷新，不阻塞 UI）
-async function fetchModelsFor(id, notify) {
-  const p = S.providers.find((x) => x.id === id);
-  if (!p) return;
-  if (!p.baseUrl) { if (notify) toast("该端点没有 BaseURL", "bad"); return; }
-  try {
-    const models = await listModels(p, { timeoutMs: S.settings.connectTimeoutMs });
-    p.models = models;
-    await storeSave("providers", S.providers);
-    renderProviders();
-    renderAll();
-    if (notify) toast(`${p.name}：获取到 ${models.length} 个模型`, "ok");
-    return models;
-  } catch (e) {
-    if (notify) toast(`获取失败：${e.message}`, "bad");
-  }
-}
-
-function editProvider(id) {
-  const p = S.providers.find((x) => x.id === id);
-  if (!p) return;
-  S._editingId = id;
-  showModal(`编辑端点 · ${p.name || "(未命名)"}`, providerForm(p), [
-    { label: "取消", cls: "", fn: hideModal },
-    { label: "保存", cls: "primary", fn: () => saveProviderFromModal(p.id) },
-  ]);
-  bindModelList();
-  $("#f_type")?.addEventListener("change", (e) => {
-    const t = e.target.value;
-    const base = $("#f_base");
-    if (base && !base.value.trim()) {
-      const a = ADAPTERS[t];
-      if (a && a.defaultBase) base.value = a.defaultBase();
-    }
-  });
-  $("#f_fetch")?.addEventListener("click", fetchModelsFromForm);
-  $("#f_all")?.addEventListener("click", () => selectAllFormModels(true));
-  $("#f_none")?.addEventListener("click", () => selectAllFormModels(false));
-  $("#f_search")?.addEventListener("input", (e) => applyModelSearch(e.target.value));
-  $("#f_selmodels")?.addEventListener("input", refreshSelCount);
-  $("#f_eye")?.addEventListener("click", () => {
-    const el = $("#f_key");
-    if (!el) return;
-    const show = el.type === "password";
-    el.type = show ? "text" : "password";
-    $("#f_eye").textContent = show ? "隐藏" : "显示";
-  });
-  $("#f_clip")?.addEventListener("click", () => tryClipboardIntoForm({ manual: true }));
-}
-
-function saveProviderFromModal(id) {
-  const p = S.providers.find((x) => x.id === id);
-  if (!p) return;
-  const nm = $("#f_name").value.trim();
-  const rawBase = $("#f_base").value.trim();
-  if (!nm || !rawBase) { toast("名称和 BaseURL 必填", "bad"); return; }
-  const baseUrl = normalizeBase(rawBase, $("#f_type").value);
-  p.name = nm;
-  p.type = $("#f_type").value;
-  p.baseUrl = baseUrl;
-  p.apiKey = $("#f_key").value.trim();
-  p.enabled = $("#f_enabled").checked;
-  p.selModels = collectSelModels();
-  hideModal();
-  storeSave("providers", S.providers);
-  renderAll();
-  toast(`已保存 ${p.name}（测试模型 ${p.selModels.length || "自动"}）`, "ok");
-}
-
-// 把连接信息写进表单（供「识别剪贴板」用）
-function writeFormConn(conn, overwrite) {
-  if (!conn) return;
-  const set = (id, val) => {
-    const el = document.getElementById(id);
-    if (!el || !val) return;
-    if (!overwrite && el.value && el.value.trim()) return;
-    el.value = val;
-  };
-  if (conn.type) {
-    const sel = $("#f_type");
-    if (sel && TYPES.some((t) => t.value === conn.type)) {
-      // 仅在用户没手动改过类型时套用（新建端点视为未改）
-      if (overwrite || sel.dataset.touched !== "1") {
-        sel.value = conn.type;
-        $("#customFields")?.classList.toggle("hidden", sel.value !== "custom");
-      }
-    }
-  }
-  set("f_base", conn.baseUrl);
-  set("f_key", conn.apiKey);
-  if (conn.name) set("f_name", conn.name);
-}
-
-// 「添加端点」时探测剪贴板：有连接信息就在表单上方浮出提示条（不打断编辑表单）
-async function tryClipboardIntoForm(opts = {}) {
-  const manual = !!opts.manual;
-  const text = await clipRead();
-  if (!text) {
-    if (manual) toast("剪贴板为空或不可读", "bad");
-    return;
-  }
-  const conn = parseConnText(text);
-  if (!conn || (!conn.baseUrl && !conn.apiKey)) {
-    if (manual) toast("剪贴板里没识别到连接信息", "bad");
-    return;
-  }
-  showConnTip(conn);
-}
-
-let _tipEl = null;
-function closeConnTip() { if (_tipEl) { _tipEl.remove(); _tipEl = null; } }
-function showConnTip(conn) {
-  closeConnTip();
+mqDark.addEventListener("change", () => { if ((S.settings.theme || "auto") === "auto") applyTheme(); });
+
+// ==================== 通用 UI ====================
+function setStatus(t) { S.status = t; const el = $("#statusText"); if (el) el.textContent = t; }
+function setProgress(t) { S.progress = t; const el = $("#progressText"); if (el) el.textContent = t; }
+let toastSeq = 0;
+function toast(msg, kind) {
   const el = document.createElement("div");
-  el.className = "conn-tip";
-  el.innerHTML = `
-    <div class="ct-head"><span class="ct-ic">📋</span>识别到剪贴板连接信息</div>
-    <div class="ct-body">
-      <div class="kv"><span>名称</span><b>${esc(conn.name || "—")}</b></div>
-      <div class="kv"><span>类型</span><b>${esc(TYPE_LABEL[conn.type] || conn.type)}</b></div>
-      <div class="kv"><span>BaseURL</span><b>${esc(conn.baseUrl || "—")}</b></div>
-      <div class="kv"><span>API Key</span><b>${esc(conn.apiKey || "—")}</b></div>
-    </div>
-    <div class="ct-actions">
-      <button class="btn tiny primary" id="ct_fill">填入表单</button>
-      <button class="btn tiny" id="ct_keyonly">只填 Key</button>
-      <button class="btn tiny" id="ct_ignore">忽略</button>
-    </div>`;
-  document.body.appendChild(el);
-  _tipEl = el;
-  invoke("log", { data: "conn-tip shown " + (conn.baseUrl || "") + " key=" + (conn.apiKey ? "yes" : "no") });
-  el.querySelector("#ct_fill").addEventListener("click", () => {
-    writeFormConn(conn, true);
-    closeConnTip();
-    toast("已填入连接信息", "ok");
+  el.className = "toast " + (kind || "");
+  const lines = String(msg ?? "").split("\n");
+  lines.forEach((line, i) => {
+    const span = document.createElement("span");
+    span.className = i === 0 ? "t1" : "t2";
+    span.textContent = line;
+    el.appendChild(span);
   });
-  el.querySelector("#ct_keyonly").addEventListener("click", () => {
-    writeFormConn({ apiKey: conn.apiKey }, true);
-    closeConnTip();
-    toast("已填入 API Key", "ok");
-  });
-  el.querySelector("#ct_ignore").addEventListener("click", closeConnTip);
+  el.id = "toast_" + (++toastSeq);
+  $("#toasts").appendChild(el);
+  const ttl = 3200 + Math.max(0, lines.length - 1) * 1200;
+  setTimeout(() => { el.style.opacity = "0"; el.style.transition = "opacity .3s"; }, ttl);
+  setTimeout(() => el.remove(), ttl + 400);
 }
-
-function addProv() {
-  const p = { id: uid(), name: "", type: "openai", baseUrl: "", apiKey: "", enabled: true, models: [], selModels: [] };
-  S.providers.push(p);
-  editProvider(p.id);
-  // 自动探测剪贴板（不阻塞、失败静默）
-  setTimeout(() => { tryClipboardIntoForm().catch(() => {}); }, 260);
-}
-function delProv(id) {
-  const p = S.providers.find((x) => x.id === id);
-  if (!p) return;
-  if (!confirm(`删除端点「${p.name}」？`)) return;
-  S.providers = S.providers.filter((x) => x.id !== id);
-  storeSave("providers", S.providers);
-  renderAll();
-}
-
-// ---------------- 批量导入 ----------------
-function parseImport(text) {
-  const out = [];
-  const t = String(text || "").trim();
-  if (!t) return out;
-  if (t.startsWith("[") || t.startsWith("{")) {
-    try {
-      const j = JSON.parse(t);
-      const arr = Array.isArray(j) ? j : (j.providers || []);
-      for (const x of arr) {
-        if (!x) continue;
-        const baseUrl = x.baseUrl || x.url || "";
-        if (!baseUrl) continue;
-        out.push({
-          name: x.name || baseUrl, type: TYPES.some((tt) => tt.value === x.type) ? x.type : "openai",
-          baseUrl, apiKey: String(x.apiKey || x.key || "").replace(/^Bearer\s+/i, ""),
-        });
-      }
-      return out;
-    } catch { /* 继续按行解析 */ }
-  }
-  for (const line of t.split(/\r?\n/)) {
-    const s = line.trim();
-    if (!s || s.startsWith("#")) continue;
-    const parts = s.split("|").map((x) => x.trim());
-    let name, type = "openai", baseUrl, apiKey = "";
-    if (parts.length >= 4) { [name, type, baseUrl, apiKey] = parts; }
-    else if (parts.length === 3) {
-      if (TYPES.some((tt) => tt.value === parts[1].toLowerCase())) { [name, type, baseUrl] = parts; }
-      else { [name, baseUrl, apiKey] = parts; }
-    } else if (parts.length === 2) { [name, baseUrl] = parts; }
-    else { baseUrl = parts[0]; name = parts[0]; }
-    if (!baseUrl) continue;
-    if (!TYPES.some((tt) => tt.value === type)) type = "openai";
-    apiKey = String(apiKey || "").replace(/^Bearer\s+/i, "");
-    out.push({ name: name || baseUrl, type, baseUrl, apiKey });
-  }
-  return out;
-}
-
-function importModal() {
-  const help = `每行一个端点，格式任选：<br>
-  <span class="hint">名称 | 类型 | BaseURL | Key<br>名称 | BaseURL | Key<br>名称 | BaseURL<br>BaseURL</span><br><br>
-  <span class="hint">类型：openai（OpenAI 兼容·默认）/ anthropic / gemini / custom；也支持直接粘贴 JSON 数组。</span>`;
-  showModal("批量导入端点", `
-    <div class="field"><label>端点列表</label><textarea id="imp_text" style="min-height:160px" placeholder="中转A | openai | https://a.example.com/v1 | sk-xxx
-中转B | https://b.example.com/v1 | sk-yyy
-Claude | anthropic | https://api.anthropic.com | sk-ant-xxx
-Gemini | gemini | https://generativelanguage.googleapis.com/v1beta | AIza...
-探针 | custom | https://example.com/health"></textarea></div>
-    <div class="hint">${help}</div>`, [
-    { label: "取消", fn: hideModal },
-    { label: "导入", cls: "primary", fn: importFromModal },
-  ]);
-}
-
-function importFromModal() {
-  const list = parseImport($("#imp_text").value);
-  if (!list.length) { toast("没解析到有效端点", "bad"); return; }
-  let added = 0, skipped = 0;
-  for (const item of list) {
-    if (S.providers.some((p) => p.name === item.name && p.baseUrl === item.baseUrl)) { skipped++; continue; }
-    S.providers.push({ id: uid(), enabled: true, models: [], selModels: [], ...item });
-    added++;
-  }
-  hideModal();
-  storeSave("providers", S.providers);
-  renderAll();
-  toast(`导入完成：新增 ${added}${skipped ? " · 跳过重复 " + skipped : ""}`, "ok");
-}
-
-// ---------------- 设置 / 提示词 / 数据 ----------------
-async function saveSettings() {
-  const g = (id, def) => { const el = document.getElementById(id); return el ? el.value : def; };
-  S.settings.timeoutMs = Math.max(1000, parseInt(g("cfg_timeout", 60000)) || 60000);
-  S.settings.connectTimeoutMs = Math.max(1000, parseInt(g("cfg_ctimeout", 15000)) || 15000);
-  S.settings.latencyN = Math.max(1, Math.min(20, parseInt(g("cfg_latn", 3)) || 3));
-  S.settings.concurN = Math.max(1, Math.min(64, parseInt(g("cfg_concur", 4)) || 4));
-  S.settings.retries = Math.max(0, Math.min(3, parseInt(g("cfg_retries", 1)) || 0));
-  S.settings.gapMs = Math.max(0, parseInt(g("cfg_gap", 150)) || 0);
-  const on = document.getElementById("cfg_concur_on");
-  if (on) S.settings.tests.concur = on.checked;
-  await storeSave("settings", S.settings);
-  renderToggles();
-  renderConfig();
-  toast("参数已保存", "ok");
-}
-function toggleConcur(on) {
-  S.settings.tests.concur = !!on;
-  storeSave("settings", S.settings);
-  renderToggles();
-  toast(on ? `并发开：按 ${S.settings.concurN || 4} 并发发起请求` : "并发关：逐个请求", "ok");
-}
-
-function addPrompt() {
-  const label = $("#np_label").value.trim();
-  const user = $("#np_user").value.trim();
-  const expect = $("#np_expect").value.trim();
-  if (!label || !user) { toast("标签和内容必填", "bad"); return; }
-  S.prompts.push({ label, user, expect: expect || null });
-  storeSave("prompts", S.prompts);
-  renderConfig();
-  toast("已添加提示词", "ok");
-}
-function delPrompt(i) {
-  S.prompts.splice(i, 1);
-  storeSave("prompts", S.prompts);
-  renderConfig();
-}
-
-function openDir() {
-  if (inWV) invoke("openDataDir").then((r) => toast(r && r.ok ? "已打开：" + (r.data || "") : "打开失败", r && r.ok ? "ok" : "bad"));
-  else toast("浏览器模式下无数据目录", "bad");
-}
-function exportConfig() {
-  const data = { providers: S.providers, settings: S.settings, prompts: S.prompts, exportedAt: new Date().toISOString() };
-  const name = `config-${new Date().toISOString().slice(0, 19).replace(/[T:]/g, "-")}.json`;
-  if (inWV) {
-    invoke("save", { name, data: JSON.stringify(data, null, 2) }).then((r) =>
-      toast(r && r.ok ? `已导出：${name}` : "导出失败", r && r.ok ? "ok" : "bad"));
-  } else {
-    const a = document.createElement("a");
-    a.href = URL.createObjectURL(new Blob([JSON.stringify(data, null, 2)], { type: "application/json" }));
-    a.download = name; a.click();
-  }
-}
-function importConfig() {
-  const txt = $("#cfg_import")?.value?.trim();
-  if (!txt) { toast("先粘贴配置 JSON", "bad"); return; }
-  try {
-    const j = JSON.parse(txt);
-    if (Array.isArray(j.providers)) S.providers = j.providers.map((p) => ({ id: uid(), enabled: true, models: [], selModels: [], ...p }));
-    if (j.settings) S.settings = { ...DEFAULT_SETTINGS, ...j.settings, tests: { ...DEFAULT_SETTINGS.tests, ...(j.settings.tests || {}) } };
-    if (Array.isArray(j.prompts) && j.prompts.length) S.prompts = j.prompts;
-    storeSave("providers", S.providers);
-    storeSave("settings", S.settings);
-    storeSave("prompts", S.prompts);
-    renderAll();
-    toast("配置已导入", "ok");
-  } catch (e) {
-    toast("JSON 解析失败：" + e.message, "bad");
-  }
-}
-async function clearHistory() {
-  if (!confirm("清空全部历史记录？")) return;
-  S.runs = [];
-  await storeSave("history", S.runs);
-  renderAll();
-  toast("历史已清空", "ok");
-}
-
-// ---------------- 右键菜单 ----------------
-let _menuEl = null;
-function closeMenu() {
-  if (_menuEl) { _menuEl.remove(); _menuEl = null; }
-}
-function openMenu(x, y, title, items) {
-  closeMenu();
-  const el = document.createElement("div");
-  el.className = "ctxmenu";
-  const rows = items.filter(Boolean).map((it) => {
-    if (it.sep) return `<div class="ctx-sep"></div>`;
-    return `<button class="ctx-item ${it.kind || ""}" data-act="${esc(it.id || it.label)}" ${it.disabled ? "disabled" : ""}>${esc(it.label)}${it.hint ? `<span class="ctx-hint">${esc(it.hint)}</span>` : ""}</button>`;
-  }).join("");
-  el.innerHTML = (title ? `<div class="ctx-title">${esc(title)}</div>` : "") + rows;
-  document.body.appendChild(el);
-  const r = el.getBoundingClientRect();
-  el.style.left = Math.max(6, Math.min(x, window.innerWidth - r.width - 8)) + "px";
-  el.style.top = Math.max(6, Math.min(y, window.innerHeight - r.height - 8)) + "px";
-  _menuEl = el;
-  el.querySelectorAll(".ctx-item").forEach((b) => {
-    b.addEventListener("click", async () => {
-      const it = items.find((x) => !x.sep && (x.id || x.label) === b.dataset.act);
-      closeMenu();
-      if (it && it.fn) await it.fn();
-    });
-  });
-}
-function menuAt(e, title, items) {
-  e.preventDefault();
-  e.stopPropagation();
-  openMenu(e.clientX, e.clientY, title, items);
-}
-
-// 复制动作：值 + 标签
-const cp = (val, label) => ({ label: "复制" + (label || ""), fn: () => copyText(val, label || "") });
-
-function providerMenu(id, e) {
-  const p = S.providers.find((x) => x.id === id);
-  if (!p) return;
-  const items = [
-    { label: "编辑端点…", fn: () => editProvider(id) },
-    { label: "检测此端点", fn: () => runBattery(false, [id]) },
-    { label: "获取模型列表", hint: (p.models || []).length ? p.models.length + " 个" : "", fn: () => fetchModelsFor(id, true) },
-    { label: (p.enabled === false ? "启用" : "停用") + "该端点", fn: async () => { p.enabled = p.enabled === false; await storeSave("providers", S.providers); renderAll(); } },
-    { sep: true },
-    cp(p.name, "名称"),
-    cp(p.baseUrl, "BaseURL"),
-    cp(p.apiKey, "API Key"),
-    { label: "复制连接配置（URL + Key）", fn: () => copyText(`${p.baseUrl}\n${p.apiKey || ""}`, "连接配置") },
-    { label: "复制已拉取模型列表", disabled: !(p.models || []).length, fn: () => copyText((p.models || []).join("\n"), (p.models || []).length + " 个模型") },
-    { sep: true },
-    { label: "删除端点", kind: "danger", fn: () => delProv(id) },
-  ];
-  menuAt(e, p.name || "端点", items);
-}
-
-function chartMenu(hostId, e) {
-  const c = charts[hostId];
-  if (!c) return;
-  const src = chartSrc();
-  const items = [
-    { label: "刷新图表", fn: () => { try { c.resize(); } catch {} renderCharts(); } },
-    { label: "导出本图表 PNG", fn: () => exportChartPng(hostId) },
-    { sep: true },
-    { label: "复制本轮数据 JSON", fn: () => copyText(JSON.stringify(src, null, 2), "本轮数据") },
-    cp(new Date(src.ts || Date.now()).toLocaleString("zh-CN", { hour12: false }), "时间"),
-    { sep: true },
-    { label: "导出报告表格（CSV）", fn: () => exportReportCsv(src) },
-  ];
-  menuAt(e, "图表", items);
-}
-
-function exportChartPng(hostId) {
-  const c = charts[hostId];
-  if (!c) { toast("图表未就绪", "bad"); return; }
-  try {
-    const url = c.getDataURL({ pixelRatio: 2, backgroundColor: pal().panel });
-    const name = `chart-${hostId}-${stampName()}.png`;
-    const a = document.createElement("a");
-    a.href = url; a.download = name; a.click();
-    toast("已导出图表：" + name, "ok");
-  } catch (err) { toast("导出失败：" + err.message, "bad"); }
-}
-
-function currentRows() {
-  return S.filterRun ? S.filterRun.rows : (S.runs.length && !S.running ? S.runs[0].rows : S.rows);
-}
-function rowSourceTs() {
-  if (S.filterRun) return S.filterRun.ts;
-  if (S.runs.length && !S.running) return S.runs[0].ts;
-  return S.activeRun ? S.activeRun.ts : null;
-}
-
-function recordMenu(idx, e) {
-  const r = (S._shownRows || currentRows())[idx];
-  if (!r) return;
-  const items = [
-    { label: r.ok ? "复制详情" : "复制错误", fn: () => copyText(r.error || r.preview || "", "详情") },
-    cp(r.provider || "", "端点"),
-    cp(r.model || "", "模型"),
-    { label: "复制整行（TSV）", fn: () => copyText(rowTsv(r), "整行") },
-    { sep: true },
-    { label: "只看此端点", fn: () => { S.filterProv = r.provider; S.filter = "all"; renderRecords(); } },
-    { label: "只看失败", fn: () => { S.filter = "fail"; renderRecords(); } },
-    { sep: true },
-    { label: "导出报告表格（CSV）", fn: () => exportReportCsv(S.filterRun || { ts: rowSourceTs(), rows: currentRows() }) },
-    { label: "导出本表格（CSV）", fn: () => exportCsv() },
-  ];
-  menuAt(e, KINDS[r.kind] || "记录", items);
-}
-const rowTsv = (r) => [
-  hhmmss(r.t || Date.now()), r.provider, KINDS[r.kind] || r.kind, r.model || "",
-  r.ok ? "通过" : "失败",
-  r.agg ? `p50 ${r.p50} / p95 ${r.p95}` : (r.latencyMs ?? ""),
-  r.ttftMs ?? "", r.tps != null ? `${r.tps} ${r.unit || ""}` : "", r.error || r.preview || "",
-].join("\t");
-
-// 「按模型汇总」行的右键菜单：复制模型名 / 只看此端点 / 复制失败原因 / 导出
-function modelRowMenu(prov, model, e) {
-  const rows = currentRows().filter((r) => r.provider === prov && r.model === model);
-  if (!rows.length) return;
-  const st = modelStat(rows);
-  const reason = classifyFails(rows);
-  const items = [
-    cp(model, "模型名"),
-    cp(prov, "端点"),
-    { label: `复制状态摘要（${st.status}）`, fn: () => copyText(`${prov} / ${model} · ${st.status} · 通过 ${st.ok}/${st.total}${reason ? " · " + reason : ""}`, "摘要") },
-  ];
-  if (st.status !== "成功" && rows.some((r) => !r.ok)) {
-    items.push({ label: "复制失败原因（全文）", fn: () => copyText([...new Set(rows.filter((r) => !r.ok).map((r) => r.error || r.preview || "").filter(Boolean))].join("\n"), "失败原因") });
-  }
-  items.push(
-    { sep: true },
-    { label: "只看此端点", fn: () => { S.filterProv = prov; renderRecords(); } },
-    { label: "导出报告表格（CSV）", fn: () => exportReportCsv(S.filterRun || { ts: rowSourceTs(), rows: currentRows() }) },
-  );
-  menuAt(e, model || "模型", items);
-}
-
-function historyMenu(ts, e) {
-  const r = S.runs.find((x) => x.ts === ts);
-  if (!r) return;
-  const items = [
-    { label: "查看本轮", fn: () => window.AH.viewRun(ts) },
-    { label: "导出报告表格（CSV）", fn: () => exportReportCsv(r) },
-    { sep: true },
-    cp(new Date(r.ts).toLocaleString("zh-CN", { hour12: false }), "时间"),
-    { label: "复制本轮摘要", fn: () => copyText(`${new Date(r.ts).toLocaleString("zh-CN", { hour12: false })} 端点${r.providerCount} 用例${r.rows.length} 通过${r.stats.pass} 失败${r.stats.fail} ${(r.durationMs / 1000).toFixed(1)}s`, "摘要") },
-    { sep: true },
-    { label: "清空本轮记录", kind: "danger", fn: () => { S.filterRun = r; clearRecords(); } },
-    { label: "删除本轮", kind: "danger", fn: () => window.AH.delRun(ts) },
-  ];
-  menuAt(e, "历史记录", items);
-}
-
-// ---------------- 报告导出（端点 × 模型 × 明细） ----------------
-function stampName() {
-  return new Date().toISOString().slice(0, 19).replace(/[T:]/g, "-");
-}
-// 统一落盘：原生壳写数据目录 / 浏览器走下载
-function saveFile(name, text) {
-  if (inWV) {
-    invoke("save", { name, data: text }).then((r) =>
-      toast(r && r.ok ? `已导出到数据目录：${name}` : "导出失败", r && r.ok ? "ok" : "bad"));
-  } else {
-    const a = document.createElement("a");
-    a.href = URL.createObjectURL(new Blob([text], { type: "text/csv;charset=utf-8" }));
-    a.download = name; a.click();
-  }
-}
-const csvCell = (v) => `"${String(v ?? "").replace(/"/g, '""')}"`;
-const csvRow = (arr) => arr.map(csvCell).join(",");
-
-// 汇总某个模型在本次检测中的表现
-function modelStat(rows) {
-  const ok = rows.filter((r) => r.ok).length;
-  const fail = rows.length - ok;
-  const lat = rows.filter((r) => r.ok && r.latencyMs != null).map((r) => r.latencyMs);
-  const ttfts = rows.filter((r) => r.ok && r.ttftMs != null).map((r) => r.ttftMs);
-  const tps = rows.filter((r) => r.ok && r.tps != null).map((r) => r.tps);
-  const aggRows = rows.filter((r) => r.agg);
-  const errs = [...new Set(rows.filter((r) => !r.ok).map((r) => r.error || r.preview || "失败"))];
-  return {
-    ok, fail,
-    total: rows.length,
-    status: !rows.length ? "未测试" : fail === 0 ? "成功" : ok === 0 ? "失败" : "部分成功",
-    p50: aggRows.length ? aggRows[aggRows.length - 1].p50 : pct(lat, 0.5),
-    p95: aggRows.length ? aggRows[aggRows.length - 1].p95 : pct(lat, 0.95),
-    ttft: ttfts.length ? Math.round(avg(ttfts)) : null,
-    tps: tps.length ? Math.round(avg(tps) * 10) / 10 : null,
-    unit: rows.find((r) => r.unit)?.unit || "tok/s",
-    errors: errs.slice(0, 3),
-    kinds: [...new Set(rows.map((r) => KINDS[r.kind] || r.kind))],
-  };
-}
-
-// 报告：块1 = 端点（API/Key + 成功模型/失败模型），块2 = 逐模型，块3 = 用例明细
-function buildReport(run) {
-  const src = run || { ts: rowSourceTs() || Date.now(), rows: currentRows(), concur: [] };
-  const rows = (src.rows || []);
-  const when = new Date(src.ts || Date.now()).toLocaleString("zh-CN", { hour12: false });
-  const pass = rows.filter((r) => r.ok).length;
-  const fail = rows.filter((r) => !r.ok).length;
-  const tested = S.providers.filter((p) => rows.some((r) => r.provider === p.name));
-
-  const head = [
-    `# API 健康检测报告`,
-    `# 时间,${csvCell(when)}`,
-    `# 端点,${tested.length}(已测) / ${S.providers.length}(配置)`,
-    `# 用例,${rows.length}  通过,${pass}  失败,${fail}`,
-    "",
-  ];
-
-  // 块1：端点汇总 —— 含 API / Key / 成功模型 / 失败模型
-  const block1 = [csvRow(["端点汇总", "", "", "", "", "", "", "", "", ""])];
-  block1.push(csvRow(["端点", "类型", "BaseURL", "APIKey", "已测模型", "成功模型", "部分成功", "失败模型", "通过", "失败", "连接状态"]));
-  for (const p of S.providers) {
-    const prows = rows.filter((r) => r.provider === p.name);
-    const conn = prows.find((r) => r.kind === "connect");
-    const models = [...new Set(prows.map((r) => r.model).filter(Boolean))];
-    const s = models.map((m) => ({ m, st: modelStat(prows.filter((r) => r.model === m)) }));
-    const goodM = s.filter((x) => x.st.status === "成功").map((x) => x.m);
-    const partM = s.filter((x) => x.st.status === "部分成功").map((x) => x.m);
-    const badM = s.filter((x) => x.st.status === "失败").map((x) => x.m);
-    block1.push(csvRow([
-      p.name, TYPE_LABEL[p.type] || p.type, p.baseUrl, p.apiKey || "",
-      models.length, goodM.join(" / "), partM.join(" / "), badM.join(" / "),
-      prows.filter((r) => r.ok).length, prows.filter((r) => !r.ok).length,
-      !prows.length ? "未测试" : (conn ? (conn.ok ? `正常 ${conn.latencyMs}ms` : "失败") : (p.agg ? `p50 ${p.p50} / p95 ${p.p95}` : p.name && "—")),
-    ]));
-  }
-  block1.push("");
-
-  // 块2：逐模型结果
-  const block2 = [csvRow(["模型结果", "", "", "", "", "", "", "", "", ""])];
-  block2.push(csvRow(["端点", "模型", "状态", "用例", "通过", "失败", "p50(ms)", "p95(ms)", "TTFT(ms)", "速率", "失败原因"]));
-  for (const p of S.providers) {
-    const prows = rows.filter((r) => r.provider === p.name);
-    const models = [...new Set(prows.map((r) => r.model).filter(Boolean))];
-    if (!models.length) {
-      block2.push(csvRow([p.name, "—", prows.length ? "端点级失败" : "未测试", prows.length, 0, prows.length, "", "", "", "", prows[0]?.error || ""]));
-      continue;
-    }
-    for (const m of models) {
-      const st = modelStat(prows.filter((r) => r.model === m));
-      block2.push(csvRow([
-        p.name, m, st.status, st.total, st.ok, st.fail,
-        st.p50 ?? "", st.p95 ?? "", st.ttft ?? "",
-        st.tps != null ? `${st.tps} ${st.unit}` : "",
-        st.errors.join(" | "),
-      ]));
-    }
-  }
-  block2.push("");
-
-  // 块3：用例明细
-  const block3 = [csvRow(["用例明细", "", "", "", "", "", "", "", "", "", ""])];
-  block3.push(csvRow(["时间", "端点", "模型", "测试项", "结果", "延迟ms", "TTFTms", "速率", "详情"]));
-  const detail = rows.length ? rows : (S.filterRun?.rows || S.runs[0]?.rows || S.rows);
-  for (const r of detail) {
-    block3.push(csvRow([
-      new Date(r.t || src.ts || Date.now()).toLocaleString("zh-CN", { hour12: false }),
-      r.provider || "", r.model || "—", (KINDS[r.kind] || r.kind || "") + (r.agg ? " 聚合" : ""),
-      r.ok ? "通过" : "失败",
-      r.agg ? `p50 ${r.p50} / p95 ${r.p95}` : (r.latencyMs ?? ""),
-      r.ttftMs ?? "", r.tps != null ? `${r.tps} ${r.unit || ""}` : "",
-      r.error || r.preview || "",
-    ]));
-  }
-
-  // 块4：并发测试（有才输出）
-  const cur = src.concur || [];
-  let block4 = [];
-  if (cur.length) {
-    block4 = ["", csvRow(["并发测试", "", "", "", "", "", "", "", "", ""])];
-    block4.push(csvRow(["端点", "模型", "并发数", "成功", "失败", "avg(ms)", "p50(ms)", "p95(ms)", "吞吐(req/s)", "墙钟(ms)", "错误"]));
-    for (const r of cur) {
-      block4.push(csvRow([
-        r.provider || "", r.model || "", r.concurrency, r.ok, r.fail,
-        r.avgMs ?? "", r.p50 ?? "", r.p95 ?? "", r.throughput ?? "", r.wallMs ?? "",
-        (r.errors || []).join(" | "),
-      ]));
-    }
-  }
-  return [...head, ...block1, ...block2, ...block3, ...block4].join("\r\n") + "\r\n";
-}
-
-function exportReportCsv(run) {
-  try {
-    const text = "\ufeff" + buildReport(run);
-    const name = `api-health-report-${stampName()}.csv`;
-    saveFile(name, text);
-    toast("报告已生成（端点 / 模型 / 明细 / 并发）", "ok");
-  } catch (e) {
-    toast("报告生成失败：" + e.message, "bad");
-  }
-}
-
-// ---------------- 模态 / Toast ----------------
 function showModal(title, bodyHtml, actions) {
   $("#modalTitle").textContent = title;
   $("#modalBody").innerHTML = bodyHtml;
@@ -2051,42 +216,1007 @@ function showModal(title, bodyHtml, actions) {
   });
   $("#modal").classList.remove("hidden");
 }
-function hideModal() { $("#modal").classList.add("hidden"); }
+const hideModal = () => $("#modal").classList.add("hidden");
 
-let toastSeq = 0;
-function toast(msg, kind) {
+let _menuEl = null;
+const closeMenu = () => { if (_menuEl) { _menuEl.remove(); _menuEl = null; } };
+function openMenu(x, y, title, items) {
+  closeMenu();
   const el = document.createElement("div");
-  el.className = "toast " + (kind || "");
-  // 支持多行：第一行标题，后续行次要色（textContent 不解析 \n，需按行建节点）
-  const lines = String(msg ?? "").split("\n");
-  lines.forEach((line, i) => {
-    const span = document.createElement("span");
-    span.className = i === 0 ? "t1" : "t2";
-    span.textContent = line;
-    el.appendChild(span);
+  el.className = "ctxmenu";
+  el.innerHTML = (title ? `<div class="ctx-title">${esc(title)}</div>` : "") +
+    items.filter(Boolean).map((it) => it.sep
+      ? `<div class="ctx-sep"></div>`
+      : `<button class="ctx-item ${it.kind || ""}" data-act="${esc(it.id || it.label)}" ${it.disabled ? "disabled" : ""}>${esc(it.label)}${it.hint ? `<span class="ctx-hint">${esc(it.hint)}</span>` : ""}</button>`
+    ).join("");
+  document.body.appendChild(el);
+  const r = el.getBoundingClientRect();
+  el.style.left = Math.max(6, Math.min(x, window.innerWidth - r.width - 8)) + "px";
+  el.style.top = Math.max(6, Math.min(y, window.innerHeight - r.height - 8)) + "px";
+  _menuEl = el;
+  el.querySelectorAll(".ctx-item").forEach((b) => {
+    b.addEventListener("click", async () => {
+      const it = items.find((x) => !x.sep && (x.id || x.label) === b.dataset.act);
+      closeMenu();
+      if (it && it.fn) await it.fn();
+    });
   });
-  el.id = "toast_" + (++toastSeq);
-  $("#toasts").appendChild(el);
-  // 行数多时多留一会儿
-  const ttl = 3200 + Math.max(0, lines.length - 1) * 1400;
-  setTimeout(() => { el.style.opacity = "0"; el.style.transition = "opacity .3s"; }, ttl);
-  setTimeout(() => el.remove(), ttl + 400);
+}
+function menuAt(e, title, items) { e.preventDefault(); e.stopPropagation(); openMenu(e.clientX, e.clientY, title, items); }
+const cp = (val, label) => ({ label: "复制" + (label || ""), fn: () => copyText(val, label || "") });
+
+// ==================== 执行记录时间轴 ====================
+function log(kind, text, sub, cls) {
+  S.timeline.push({ t: Date.now(), kind, text, sub, cls: cls || "" });
+  if (S.timeline.length > 600) S.timeline.splice(0, S.timeline.length - 600);
+  renderTimeline();
+}
+function renderTimeline() {
+  const el = $("#timeline");
+  if (!el) return;
+  if (!S.timeline.length) {
+    el.innerHTML = `<div class="tl-empty">还没有执行记录<br>点右上角「开始检测」跑一轮</div>`;
+    return;
+  }
+  el.innerHTML = S.timeline.map((e) => `
+    <div class="tl-item ${e.cls || ""}">
+      <div class="tl-head"><span class="tl-kind ${e.cls || ""}">${esc(e.kind)}</span><span class="tl-time">${hhmmss(e.t)}</span></div>
+      <div class="tl-text">${esc(e.text)}</div>
+      ${e.sub ? `<div class="tl-sub">${esc(e.sub)}</div>` : ""}
+    </div>`).join("");
+  if (S.settings.followLog && $("#followLog") && $("#followLog").checked) el.scrollTop = el.scrollHeight;
 }
 
-// ---------------- 静态绑定 ----------------
+// ==================== 生成文件预览 ====================
+function showGen(gen) { S.gen = gen; renderGen(); }
+function renderGen() {
+  const el = $("#genbox");
+  if (!el) return;
+  if (!S.gen) { el.innerHTML = `<div class="empty">模型生成 SVG 后，这里会自动预览（动画实时播放）</div>`; return; }
+  const g = S.gen;
+  if (g.kind === "iframe") {
+    el.innerHTML = `<iframe sandbox="allow-scripts" srcdoc="${esc(g.html)}"></iframe>`;
+  } else {
+    el.innerHTML = `<img alt="${esc(g.title || "生成文件")}" src="${svgDataUrl(g.svg)}">`;
+  }
+}
+
+// ==================== 帧捕获（canvas） ====================
+async function captureFrames(svg, times = [400, 1500, 3000], size = 360) {
+  const url = svgDataUrl(ensureSvgSize(svg));
+  const holder = document.createElement("div");
+  holder.style.cssText = "position:fixed;left:-10000px;top:0;width:480px;height:480px;overflow:hidden;pointer-events:none;";
+  const img = new Image();
+  img.width = 480; img.height = 480;
+  holder.appendChild(img);
+  document.body.appendChild(holder);
+  try {
+    await new Promise((res, rej) => {
+      img.onload = () => res(true);
+      img.onerror = () => rej(new Error("SVG 无法渲染"));
+      img.src = url;
+    });
+    const canvas = document.createElement("canvas");
+    const ctx = canvas.getContext("2d");
+    const w = img.naturalWidth || 400, h = img.naturalHeight || 400;
+    const scale = Math.min(1, size / Math.max(w, h));
+    canvas.width = Math.max(1, Math.round(w * scale));
+    canvas.height = Math.max(1, Math.round(h * scale));
+    const frames = [];
+    const t0 = performance.now();
+    for (const t of times) {
+      const wait = t - (performance.now() - t0);
+      if (wait > 0) await sleep(wait);
+      ctx.fillStyle = "#ffffff";
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
+      try { ctx.drawImage(img, 0, 0, canvas.width, canvas.height); } catch { /* 绘制失败保留白底 */ }
+      frames.push(canvas.toDataURL("image/png"));
+    }
+    const motion = new Set(frames).size > 1;
+    return { frames, motion };
+  } finally {
+    holder.remove();
+  }
+}
+
+// ==================== 端点渲染 ====================
+function renderProviders() {
+  const el = $("#providers");
+  if (!el) return;
+  if (!S.providers.length) {
+    el.innerHTML = `<div class="empty-sm">暂无端点 · 点「+ 添加」或粘贴连接信息</div>`;
+    return;
+  }
+  el.innerHTML = S.providers.map((p) => {
+    const testing = S.runCursor && S.runCursor.id === p.id;
+    const done = S.doneIds && S.doneIds.has(p.id);
+    const cls = ["prov", p.enabled === false ? "off" : "", testing ? "testing" : "", done && !testing ? "done" : ""].filter(Boolean).join(" ");
+    const n = selModels(p).length;
+    return `<div class="${cls}" data-id="${p.id}" title="左键编辑 · 右键更多">
+      <div class="prov-top">
+        <span class="lamp ${testing ? "busy" : done ? "ok" : ""}"></span>
+        <span class="prov-name">${esc(p.name || "(未命名)")}</span>
+      </div>
+      <div class="prov-meta">${esc(p.baseUrl || "")}</div>
+      <div class="prov-row">
+        <span class="badge">${TYPE_LABEL[p.type] || p.type}</span>
+        <span class="badge">${p.models && p.models.length ? p.models.length + " 模型" : "未拉取"}</span>
+        <span class="badge">${n ? "测 " + n + " 个" : "未选模型"}</span>
+      </div>
+      ${testing && S.runCursor.phase ? `<div class="prov-phase">${esc(S.runCursor.phase)}</div>` : ""}
+    </div>`;
+  }).join("");
+  el.querySelectorAll(".prov").forEach((node) => {
+    node.addEventListener("click", () => editProvider(node.dataset.id));
+    node.addEventListener("contextmenu", (e) => providerMenu(node.dataset.id, e));
+  });
+}
+function markTesting(id, phase) { S.runCursor = id ? { id, phase: phase || "检测中" } : null; renderProviders(); }
+function setPhase(phase) {
+  if (!S.runCursor) return;
+  S.runCursor.phase = phase;
+  const node = document.querySelector(`.prov[data-id="${S.runCursor.id}"] .prov-phase`);
+  if (node) node.textContent = phase; else renderProviders();
+}
+function markDone(id) {
+  if (!S.doneIds) S.doneIds = new Set();
+  if (id) S.doneIds.add(id);
+  if (S.runCursor && S.runCursor.id === id) S.runCursor = null;
+  renderProviders();
+}
+
+// ==================== 题库侧栏 ====================
+function renderQList() {
+  const el = $("#qList");
+  if (!el) return;
+  el.innerHTML = QUESTIONS.map((q) => `
+    <label title="${esc(q.type)} · 参考难度 ${q.level}/5">
+      <input type="checkbox" data-q="${q.id}" ${S.settings.qEnabled[q.id] !== false ? "checked" : ""}>
+      <span class="qno">${q.no}.</span><span>${esc(q.type)}</span>
+    </label>`).join("");
+  el.querySelectorAll("input[data-q]").forEach((cb) => {
+    cb.addEventListener("change", () => {
+      S.settings.qEnabled[cb.dataset.q] = cb.checked;
+      storeSave("settings", S.settings);
+      renderBankCount();
+    });
+  });
+  renderBankCount();
+}
+function renderBankCount() {
+  const el = $("#bankCount");
+  if (el) el.textContent = `${enabledQuestions().length}/${QUESTIONS.length} 题 · SVG ${enabledTasks().length}/${SVG_TASKS.length}`;
+}
+
+// ==================== 裁判模型下拉 ====================
+function renderJudgeSelect() {
+  const el = $("#cfgJudgeModel");
+  if (!el) return;
+  const opts = [`<option value="">跟随被测模型</option>`];
+  for (const p of S.providers) {
+    for (const m of p.models || []) {
+      const val = p.id + "::" + m;
+      opts.push(`<option value="${esc(val)}" ${S.settings.judgeModel === val ? "selected" : ""}>${esc(p.name + " · " + m)}</option>`);
+    }
+  }
+  el.innerHTML = opts.join("");
+  const lbl = $("#judgeLabel");
+  if (lbl) lbl.textContent = S.settings.judgeModel ? "指定裁判" : "跟随被测模型";
+}
+function resolveJudge(testedP, testedModel) {
+  const v = S.settings.judgeModel;
+  if (!v) return { p: testedP, model: testedModel };
+  const parts = v.split("::");
+  const pid = parts[0];
+  const p = S.providers.find((x) => x.id === pid);
+  return p ? { p, model: parts.slice(1).join("::") } : { p: testedP, model: testedModel };
+}
+
+// ==================== 检测编排 ====================
+function cfgOf() {
+  const s = S.settings;
+  return {
+    maxTokens: s.maxTokens, temperature: 0, retries: s.retries,
+    svgMaxTokens: s.svgMaxTokens, svgTemperature: s.svgTemperature,
+    judgeMaxTokens: s.judgeMaxTokens, rlRetries: 6, rlBaseSec: 5, rlCapSec: 120,
+    maxTokensCeiling: Math.max(s.maxTokens * 2, 8192),
+    timeoutMs: s.timeoutSec * 1000,
+  };
+}
+
+async function runAll() {
+  if (S.running) return;
+  const targets = S.providers.filter((p) => p.enabled !== false && selModels(p).length);
+  if (!targets.length) { toast("没有可测的端点/模型：先添加端点并「拉模型」勾选模型", "bad"); return; }
+  const qs = enabledQuestions();
+  const tasks = S.settings.svgOn ? enabledTasks() : [];
+  if (!qs.length && !tasks.length) { toast("没有勾选任何测试项", "bad"); return; }
+  const judgeOn = S.settings.judgeOn && tasks.length > 0;
+
+  S.timeline = [];
+  S.current = { ts: Date.now(), providerCount: targets.length, models: [] };
+  S.abort = new AbortController();
+  S.doneIds = new Set();
+  S.running = true;
+  $("#btnRun").disabled = true;
+  $("#btnStop").disabled = false;
+  log("开始", `检测开始 · 端点 ${targets.length} · 学科题 ${qs.length} · SVG 题 ${tasks.length}`,
+    judgeOn ? "视觉裁判已启用" : (tasks.length ? "未启用裁判（仅生成）" : "仅学科题"), "run");
+
+  const cfg = cfgOf();
+  const signal = S.abort.signal;
+  const shouldStop = () => !S.running || signal.aborted;
+  let qTotal = 0, qCorrect = 0, svgCount = 0;
+
+  try {
+    for (const p of targets) {
+      if (shouldStop()) break;
+      const models = selModels(p);
+      markTesting(p.id, "准备中");
+      log("端点", `${p.name} · ${models.length} 个模型`, p.baseUrl, "info");
+
+      for (const model of models) {
+        if (shouldStop()) break;
+        const entry = { provider: p.name, model, type: p.type, q: [], svg: [] };
+        S.current.models.push(entry);
+        setPhase(`${model} · 学科题`);
+
+        if (qs.length) {
+          log("答题", `${model} · 开始 ${qs.length} 道学科题`, `并发 ${S.settings.concurrency}`, "info");
+          const done = { n: 0 };
+          const rows = await runPool(qs, S.settings.concurrency, async (q) => {
+            if (shouldStop()) return null;
+            const row = await opAskQuestion(p, model, q, cfg, {
+              signal,
+              onNote: (m) => log("重试", `${model} · ${q.id}：${m}`, "", "warn"),
+            });
+            if (!row) return null;
+            done.n++;
+            setProgress(`${model} · 学科题 ${done.n}/${qs.length}`);
+            qTotal++; if (row.ok) qCorrect++;
+            log(row.ok ? "答对" : "答错",
+              `${model} · ${q.id} ${q.type}`,
+              `${row.ok ? "命中" : (row.got ? "答：" + String(row.got).slice(0, 60) : (row.error || "无答案"))} · ${row.latencyMs}ms`,
+              row.ok ? "ok" : "bad");
+            return row;
+          }, shouldStop);
+          entry.q = rows.filter(Boolean).sort((a, b) => a.no - b.no);
+          const ok = entry.q.filter((r) => r.ok).length;
+          log("小结", `${model} · 学科题 ${ok}/${entry.q.length}`,
+            `正确率 ${entry.q.length ? Math.round((ok / entry.q.length) * 100) : 0}%`,
+            ok === entry.q.length ? "ok" : (ok === 0 ? "bad" : "warn"));
+        }
+
+        for (const task of tasks) {
+          if (shouldStop()) break;
+          setPhase(`${model} · ${task.title}`);
+          log("画图", `${model} · ${task.title}`, "生成 SVG 中…", "info");
+          const row = await opGenSvg(p, model, task, cfg, {
+            signal, onNote: (m) => log("重试", `${model} · ${task.title}：${m}`, "", "warn"),
+          });
+          if (shouldStop()) break;
+          svgCount++;
+          if (!row.ok) {
+            log("画图失败", `${model} · ${task.title}`, row.error || "生成失败", "bad");
+            entry.svg.push(row);
+            continue;
+          }
+          showGen({ kind: "img", svg: row.svg, title: `${model} · ${task.title}` });
+          let frames = [], motion = null;
+          try {
+            const cap = await captureFrames(row.svg);
+            frames = cap.frames; motion = cap.motion;
+            row.frames = frames; row.motion = motion;
+          } catch (e) {
+            log("渲染告警", `${model} · ${task.title}`, "SVG 无法渲染成帧：" + e.message, "warn");
+          }
+          log("画图完成", `${model} · ${task.title}`,
+            `${row.svg.length} 字节 · ${frames.length} 帧 · 动画${motion ? "有" : "无"} · ${row.latencyMs}ms`, "ok");
+
+          if (judgeOn && frames.length) {
+            const j = resolveJudge(p, model);
+            setPhase(`${model} · ${task.title} · 裁判`);
+            log("裁判", `${task.title} · 由 ${j.model} 评审`, "上传帧 + 源码…", "info");
+            const jr = await opJudgeSvg(j.p, j.model, task, { candidateFrames: frames, svg: row.svg, motion }, cfg, { signal });
+            row.judge = jr.judge || null;
+            row.judgeRaw = jr.raw || "";
+            row.judgeModel = j.model;
+            row.judgeError = jr.error || "";
+            if (jr.ok) {
+              log("裁判结论", `${task.title} · ${jr.judge.score} 分 ${starsText(jr.judge.stars)}`,
+                jr.judge.verdict || "", jr.judge.score >= 60 ? "ok" : "warn");
+            } else {
+              log("裁判失败", `${task.title}`, jr.error || "失败", "bad");
+            }
+          }
+          entry.svg.push(row);
+        }
+        markDone(p.id);
+      }
+    }
+  } catch (e) {
+    log("异常", "检测中断：" + ((e && e.message) || e), "", "bad");
+  }
+
+  S.running = false;
+  S.runCursor = null;
+  S.doneIds = null;
+  $("#btnRun").disabled = false;
+  $("#btnStop").disabled = true;
+  setProgress("");
+  renderProviders();
+
+  const interrupted = S.abort && S.abort.signal.aborted;
+  const run = S.current;
+  S.current = null;
+  run.durationMs = Date.now() - run.ts;
+  run.interrupted = !!interrupted;
+  run.judgeOn = judgeOn;
+  run.qCount = qTotal; run.qCorrect = qCorrect; run.svgCount = svgCount;
+  S.runs.unshift(run);
+  if (S.runs.length > 60) S.runs.length = 60;
+  await storeSave("runs", S.runs);
+  S.runFilter = null;
+  renderAll();
+
+  const st = runStats(run);
+  const rate = st.qRate == null ? "—" : st.qRate + "%";
+  setStatus(`${interrupted ? "已停止" : "完成"} · 学科题 ${st.qCorrect}/${st.qTotal}（${rate}）· SVG ${st.svgTotal} 张 · ${(run.durationMs / 1000).toFixed(1)}s`);
+  log(interrupted ? "已停止" : "完成",
+    `学科题 ${st.qCorrect}/${st.qTotal} · SVG ${st.svgTotal} 张`,
+    `${(run.durationMs / 1000).toFixed(1)}s`, interrupted ? "warn" : "ok");
+  toast(`检测${interrupted ? "已停止" : "完成"}：学科题 ${st.qCorrect}/${st.qTotal}${st.svgTotal ? ` · SVG ${st.svgTotal} 张` : ""}`,
+    interrupted ? "warn" : (st.qTotal && st.qCorrect === st.qTotal ? "ok" : "bad"));
+}
+
+function stopRun() {
+  if (!S.running) return;
+  S.running = false;
+  try { S.abort.abort(); } catch { /* noop */ }
+  setStatus("正在停止…");
+}
+
+// ==================== 成绩单 ====================
+const scoreClass = (rate) => (rate == null ? "" : rate >= 80 ? "good" : rate >= 50 ? "mid" : "bad");
+
+function renderResults() {
+  const el = $("#view-results");
+  if (!el) return;
+  const run = currentRun();
+  if (!run || !run.models || !run.models.length) {
+    el.innerHTML = `<div class="empty">还没有成绩 · 点右上角「开始检测」跑一轮</div>`;
+    return;
+  }
+  const models = run.models.slice().sort((a, b) => (modelStats(b).qRate ?? -1) - (modelStats(a).qRate ?? -1));
+  const cards = models.map((m) => {
+    const st = modelStats(m);
+    const gs = groupStats(m.q || []);
+    return `<div class="card">
+      <div class="card-head">
+        <div><div class="card-name">${esc(m.model)}</div><div class="sub">${esc(m.provider)}</div></div>
+        <span class="pill ${st.qRate == null ? "mute" : st.qRate >= 80 ? "ok" : st.qRate >= 50 ? "warn" : "bad"}">${st.qRate == null ? "未测" : st.qRate + "%"}</span>
+      </div>
+      <div class="score-wrap">
+        <span class="score ${scoreClass(st.qRate)}">${st.qRate == null ? "—" : st.qRate}</span>
+        <span class="score-unit">IQ 分 · ${st.qCorrect}/${st.qTotal} 题</span>
+      </div>
+      ${gs.map((g) => `<div class="card-row"><span>${esc(g.label)}</span><b>${g.ok}/${g.total}</b></div>
+        <div class="bar"><i style="width:${g.rate ?? 0}%"></i></div>`).join("")}
+      <div class="card-row" style="margin-top:8px"><span>SVG 动画</span><b>${st.svgJudged ? starsText(Math.round(st.svgAvgStars)) + " " + st.svgAvgStars + "★" : (st.svgTotal ? st.svgTotal + " 张（未评审）" : "—")}</b></div>
+      <div class="card-row"><span>平均延迟</span><b>${st.avgLatencyMs == null ? "—" : st.avgLatencyMs + "ms"}</b></div>
+      <div class="card-row"><span>Tokens</span><b>${st.tokens || 0}</b></div>
+    </div>`;
+  }).join("");
+
+  const chart = barChart(models.map((m) => ({ label: m.model, value: modelStats(m).qRate ?? 0 })), { title: "学科题正确率对比", unit: "%", max: 100 });
+
+  const rows = [];
+  for (const m of models) {
+    for (const r of m.q || []) {
+      if (S.filter.model && m.model !== S.filter.model) continue;
+      if (S.filter.group && r.group !== S.filter.group) continue;
+      if (S.filter.ok === "ok" && !r.ok) continue;
+      if (S.filter.ok === "fail" && r.ok) continue;
+      rows.push({ m, r });
+    }
+  }
+  const table = rows.length ? `<div class="table-wrap"><table>
+    <thead><tr><th>模型</th><th>题号</th><th>题型</th><th>结果</th><th class="wrap">期望答案</th><th class="wrap">模型答案</th><th>延迟</th><th>Tokens</th></tr></thead>
+    <tbody>${rows.map(({ m, r }, i) => {
+      const key = m.provider + "|" + m.model + "|" + r.qid;
+      const open = S.expanded.has(key);
+      return `<tr data-key="${esc(key)}" data-i="${i}" title="点击展开 · 右键：复核 / 重测 / 复制">
+        <td>${esc(m.model)}</td>
+        <td class="num-cell">${r.qid}</td>
+        <td>${esc(r.type)}</td>
+        <td><span class="pill ${r.ok ? "ok" : "bad"}">${r.ok ? "答对" : "答错"}</span>${r.manual ? `<span class="sub"> 人工</span>` : r.aiReview ? `<span class="sub"> AI复核</span>` : ""}</td>
+        <td class="wrap">${esc(r.expected)}</td>
+        <td class="wrap">${esc(String(r.got || "").slice(0, 60))}</td>
+        <td class="num-cell">${r.latencyMs}ms</td>
+        <td class="num-cell">${r.tokens ?? "—"}</td>
+      </tr>
+      ${open ? `<tr class="detail-row"><td colspan="8"><div class="detail-box">
+        <div class="sub">判定方式：${esc(r.gradeHow || "—")}${r.followup ? " · 含补答" : ""}${r.error ? " · " + esc(r.error) : ""}</div>
+        <pre>${esc(r.raw || "（无原始输出）")}</pre>
+      </div></td></tr>` : ""}`;
+    }).join("")}</tbody>
+  </table></div>` : `<div class="empty">没有匹配的记录</div>`;
+
+  const chips = `<div class="chips">
+    <button class="chip ${!S.filter.model ? "active" : ""}" data-f="model" data-v="">全部模型</button>
+    ${models.map((m) => `<button class="chip ${S.filter.model === m.model ? "active" : ""}" data-f="model" data-v="${esc(m.model)}">${esc(m.model)}</button>`).join("")}
+    <span class="spacer"></span>
+    <button class="chip ${S.filter.ok === "ok" ? "active" : ""}" data-f="ok" data-v="ok">只看答对</button>
+    <button class="chip ${S.filter.ok === "fail" ? "active" : ""}" data-f="ok" data-v="fail">只看答错</button>
+    <button class="chip" data-f="report">导出报告 CSV</button>
+    <button class="chip" data-f="share">生成分享报告</button>
+  </div>`;
+
+  el.innerHTML = `<div class="cards">${cards}</div>${chart}${chips}${table}`;
+
+  el.querySelectorAll("[data-f]").forEach((b) => b.addEventListener("click", () => {
+    const f = b.dataset.f;
+    if (f === "report") return exportCsv();
+    if (f === "share") return shareModal();
+    if (f === "model") S.filter.model = b.dataset.v || "";
+    if (f === "ok") S.filter.ok = S.filter.ok === b.dataset.v ? "" : b.dataset.v;
+    renderResults();
+  }));
+  el.querySelectorAll("tbody tr[data-key]").forEach((tr) => {
+    tr.addEventListener("click", () => {
+      const k = tr.dataset.key;
+      if (S.expanded.has(k)) S.expanded.delete(k); else S.expanded.add(k);
+      renderResults();
+    });
+    tr.addEventListener("contextmenu", (e) => {
+      const pair = rows[Number(tr.dataset.i)];
+      if (pair) questionRowMenu(pair.m, pair.r, e);
+    });
+  });
+}
+
+function questionRowMenu(m, r, e) {
+  const q = qById(r.qid);
+  menuAt(e, `${r.qid} · ${r.type}`, [
+    { label: "复制模型答案", fn: () => copyText(r.raw || r.got || "", r.qid) },
+    cp(r.expected, "标准答案"),
+    cp(q ? q.prompt : "", "题目"),
+    { sep: true },
+    { label: "AI 复核此题", hint: "用裁判模型判等价", fn: () => aiReview(m, r) },
+    { label: "重测此题", fn: () => retest(m, r) },
+    { sep: true },
+    { label: r.ok ? "人工改判为「答错」" : "人工改判为「答对」", fn: () => manualToggle(m, r) },
+  ]);
+}
+
+async function manualToggle(m, r) {
+  r.ok = !r.ok;
+  r.manual = true;
+  await persistRuns();
+  renderAll();
+  toast(`${r.qid} 已人工改判为「${r.ok ? "答对" : "答错"}」`, "ok");
+}
+
+async function aiReview(m, r) {
+  const q = qById(r.qid);
+  const prov = S.providers.find((p) => p.name === m.provider) || S.providers[0];
+  const j = resolveJudge(prov, m.model);
+  if (!j || !j.p) { toast("先配置端点", "bad"); return; }
+  log("AI复核", `${r.qid} · 由 ${j.model} 判定`, "对比标准答案…", "info");
+  const res = await opJudgeAnswer(j.p, j.model, q, r.raw || r.got, cfgOf(), {});
+  if (!res.ok) { toast("复核失败：" + res.error, "bad"); return; }
+  r.ok = res.correct;
+  r.aiReview = res.reason || "AI 复核";
+  r.manual = false;
+  await persistRuns();
+  renderAll();
+  log("AI复核", `${r.qid} → ${res.correct ? "等价（答对）" : "不等价（答错）"}`, res.reason || "", res.correct ? "ok" : "bad");
+  toast(`${r.qid} AI 复核：${res.correct ? "答对" : "答错"}\n${res.reason || ""}`, res.correct ? "ok" : "bad");
+}
+
+async function retest(m, r) {
+  const q = qById(r.qid);
+  const p = S.providers.find((x) => x.name === m.provider) || S.providers[0];
+  if (!p) { toast("端点已不存在", "bad"); return; }
+  toast(`重测 ${r.qid}…`, "ok");
+  log("重测", `${m.model} · ${r.qid}`, "重新请求…", "info");
+  const row = await opAskQuestion(p, m.model, q, cfgOf(), {});
+  Object.assign(r, row);
+  await persistRuns();
+  renderAll();
+  log(row.ok ? "重测答对" : "重测答错", `${m.model} · ${r.qid}`, row.got || row.error || "", row.ok ? "ok" : "bad");
+}
+
+async function persistRuns() { await storeSave("runs", S.runs); }
+
+function barChart(items, { title, unit = "", max = null } = {}) {
+  if (!items.length) return "";
+  const m = max || Math.max(1, ...items.map((x) => x.value || 0));
+  const rowH = 26, padL = 150, padR = 54, w = 720;
+  const h = items.length * rowH + 16;
+  const bars = items.map((x, i) => {
+    const y = i * rowH + 8;
+    const bw = Math.max(2, (w - padL - padR) * ((x.value || 0) / m));
+    return `<text x="0" y="${y + 13}" fill="var(--text2)" font-size="11">${esc(String(x.label).slice(0, 26))}</text>
+      <rect x="${padL}" y="${y + 3}" width="${w - padL - padR}" height="12" rx="6" fill="var(--bg2)"/>
+      <rect x="${padL}" y="${y + 3}" width="${bw}" height="12" rx="6" fill="${x.color || "var(--accent)"}"/>
+      <text x="${padL + bw + 8}" y="${y + 13}" fill="var(--text)" font-size="11">${x.value}${unit}</text>`;
+  }).join("");
+  return `<div class="chart-card" style="margin-top:12px"><div class="chart-title">${esc(title || "")}</div>
+    <svg viewBox="0 0 ${w} ${h}" width="100%" height="${h}" role="img" aria-label="${esc(title || "图表")}">${bars}</svg></div>`;
+}
+
+// ==================== SVG 画廊 ====================
+function renderGallery() {
+  const el = $("#view-gallery");
+  if (!el) return;
+  const run = currentRun();
+  if (!run || !run.models || !run.models.length) { el.innerHTML = `<div class="empty">还没有 SVG 作品</div>`; return; }
+  const items = [];
+  for (const m of run.models) for (const r of m.svg || []) items.push({ m, r });
+  if (!items.length) {
+    el.innerHTML = `<div class="empty">本轮没有 SVG 题（在左侧勾选「测试 SVG 动画题」）</div>`;
+    return;
+  }
+  el.innerHTML = `<div class="gallery">${items.map(({ m, r }, i) => {
+    const task = taskById(r.taskId) || { title: r.title || r.taskId, criteria: [] };
+    const j = r.judge;
+    return `<div class="gcard" data-i="${i}">
+      <div class="gcard-head">
+        <span class="gcard-title">${esc(task.title)}</span>
+        <span class="badge">${esc(m.model)}</span>
+        ${j ? `<span class="pill ${j.score >= 80 ? "ok" : j.score >= 60 ? "warn" : "bad"}">${j.score} 分</span><span class="stars">${starsText(j.stars)}</span>`
+            : (r.svg ? `<span class="pill mute">未评审</span>` : `<span class="pill bad">生成失败</span>`)}
+        <span class="spacer"></span>
+        <span class="sub">${r.latencyMs}ms · ${r.tokens ?? "—"} tok${r.motion != null ? " · 动画" + (r.motion ? "有" : "无") : ""}${r.judgeModel ? " · 裁判 " + esc(r.judgeModel) : ""}</span>
+      </div>
+      <div class="gcard-body">
+        <div class="pane"><div class="pane-label"><span>模型作品</span><span>${r.svg ? (r.svg.length < 1024 ? r.svg.length + " B" : (r.svg.length / 1024).toFixed(1) + " KB") : ""}</span></div>
+          <div class="svgbox">${r.svg ? `<img alt="${esc(task.title)}" src="${svgDataUrl(r.svg)}">` : `<span class="sub">${esc(r.error || "无输出")}</span>`}</div></div>
+        <div class="pane"><div class="pane-label"><span>评分维度</span><span>${j ? "已评审" : "未评审"}</span></div>
+          <div class="svgbox" style="align-items:flex-start;display:block;overflow:auto">
+            ${(task.criteria || []).map((c, ci) => {
+              const jc = (j && j.criteria) || [];
+              // 先按名字匹配，名字对不上再按序号兜底（裁判常改维度名）
+              const cc = jc.find((x) => x.name === c || (x.name && (c.includes(x.name) || x.name.includes(c.slice(0, 6)))))
+                || (jc.length === (task.criteria || []).length ? jc[ci] : null);
+              return `<div class="crit ${cc ? (cc.pass ? "pass" : "fail") : ""}"><span class="mk">${cc ? (cc.pass ? "✓" : "✕") : "•"}</span><span>${esc(c)}${cc && cc.comment ? `<span class="sub"> — ${esc(cc.comment)}</span>` : ""}</span></div>`;
+            }).join("")}
+            ${j && j.verdict ? `<div class="sub" style="margin-top:6px">总评：${esc(j.verdict)}</div>` : ""}
+            ${j && j.problems && j.problems.length ? `<div class="sub">问题：${esc(j.problems.join("；"))}</div>` : ""}
+          </div></div>
+      </div>
+      ${r.frames && r.frames.length ? `<div class="frames">${r.frames.map((f, k) => `<img data-frame="${i}:${k}" alt="帧${k + 1}" src="${f}">`).join("")}</div>` : ""}
+      <div class="gcard-foot">
+        <button class="btn tiny" data-act="preview" ${r.svg ? "" : "disabled"}>预览到大屏</button>
+        <button class="btn tiny" data-act="judge" ${r.svg ? "" : "disabled"}>${j ? "重新裁判" : "发起裁判"}</button>
+        <button class="btn tiny" data-act="sandbox" ${r.svg && /<script/i.test(r.svg) ? "" : "disabled"} title="含脚本时可在沙箱里真实运行">沙箱运行</button>
+        <button class="btn tiny" data-act="src" ${r.svg || r.raw ? "" : "disabled"}>看源码</button>
+        <button class="btn tiny" data-act="copysvg" ${r.svg ? "" : "disabled"}>复制 SVG</button>
+        <button class="btn tiny" data-act="savesvg" ${r.svg ? "" : "disabled"}>保存 SVG</button>
+      </div>
+    </div>`;
+  }).join("")}</div>`;
+
+  el.querySelectorAll(".gcard").forEach((card) => {
+    const pair = items[Number(card.dataset.i)];
+    const m = pair.m, r = pair.r;
+    const task = taskById(r.taskId) || { title: r.title || r.taskId };
+    card.querySelectorAll("[data-act]").forEach((b) => b.addEventListener("click", async () => {
+      const act = b.dataset.act;
+      if (act === "preview") showGen({ kind: "img", svg: r.svg, title: `${m.model} · ${task.title}` });
+      if (act === "src") showModal(`${task.title} · 源码`,
+        `<pre style="white-space:pre-wrap;word-break:break-word;max-height:60vh;overflow:auto">${esc(r.svg || r.raw || "（无）")}</pre>`,
+        [{ label: "复制", fn: () => copyText(r.svg || r.raw || "", "源码") }, { label: "关闭", cls: "primary", fn: hideModal }]);
+      if (act === "copysvg") copyText(r.svg, "SVG");
+      if (act === "savesvg") saveFile(`${r.taskId}-${String(m.model).replace(/[^\w.-]+/g, "_")}.svg`, r.svg);
+      if (act === "sandbox") {
+        const html = `<!doctype html><meta charset="utf-8"><body style="margin:0;display:grid;place-items:center;height:100vh;background:#fff">${sanitizeSvg(r.svg, { keepScript: true })}</body>`;
+        showGen({ kind: "iframe", html });
+        toast("沙箱运行：脚本在隔离 iframe 内执行", "ok");
+      }
+      if (act === "judge") await judgeSvgRow(m, r, task);
+    }));
+    card.querySelectorAll("[data-frame]").forEach((img) => img.addEventListener("click", () => {
+      showModal("动画帧", `<img style="max-width:100%" src="${img.src}">`, [{ label: "关闭", cls: "primary", fn: hideModal }]);
+    }));
+  });
+}
+
+async function judgeSvgRow(m, r, task) {
+  if (!r.svg) { toast("没有 SVG 可评审", "bad"); return; }
+  const p = S.providers.find((x) => x.name === m.provider) || S.providers[0];
+  if (!p) { toast("端点已不存在", "bad"); return; }
+  const j = resolveJudge(p, m.model);
+  let frames = r.frames;
+  if (!frames || !frames.length) {
+    try { const cap = await captureFrames(r.svg); frames = cap.frames; r.frames = frames; r.motion = cap.motion; }
+    catch (e) { toast("SVG 无法渲染：" + e.message, "bad"); return; }
+  }
+  log("裁判", `${task.title} · 由 ${j.model} 评审`, "上传帧 + 源码…", "info");
+  const jr = await opJudgeSvg(j.p, j.model, task, { candidateFrames: frames, svg: r.svg, motion: r.motion }, cfgOf(), {});
+  r.judge = jr.judge || null;
+  r.judgeRaw = jr.raw || "";
+  r.judgeModel = j.model;
+  r.judgeError = jr.error || "";
+  await persistRuns();
+  renderGallery();
+  if (jr.ok) {
+    log("裁判结论", `${task.title} · ${jr.judge.score} 分 ${starsText(jr.judge.stars)}`, jr.judge.verdict || "", jr.judge.score >= 60 ? "ok" : "warn");
+    toast(`${task.title}：${jr.judge.score} 分 ${starsText(jr.judge.stars)}\n${jr.judge.verdict || ""}`, jr.judge.score >= 60 ? "ok" : "warn");
+  } else {
+    log("裁判失败", task.title, jr.error || "失败", "bad");
+    toast("裁判失败：" + (jr.error || ""), "bad");
+  }
+}
+
+// ==================== 题库视图 ====================
+function renderBank() {
+  const el = $("#view-bank");
+  if (!el) return;
+  const groups = GROUPS.map((g) => ({ g, items: QUESTIONS.filter((q) => q.group === g.key) })).filter((x) => x.items.length);
+  el.innerHTML = groups.map(({ g, items }) => `
+    <div class="bank-group">
+      <h3>${esc(g.label)} · ${items.length} 题</h3>
+      ${items.map((q) => `<div class="qitem">
+        <div class="qitem-head">
+          <span class="badge">${q.no}</span>
+          <span class="badge">${esc(q.type)}</span>
+          <span class="pill mute">难度 ${q.level}/5</span>
+          <span class="spacer"></span>
+          <span class="sub">${esc(q.id)}</span>
+        </div>
+        <div class="qitem-prompt">${esc(q.prompt)}</div>
+        <div class="qitem-answer">标准答案：<b>${esc(q.answer)}</b></div>
+        <div class="qitem-tools">
+          <button class="btn tiny" data-copy-prompt="${q.id}">复制题目</button>
+          <button class="btn tiny" data-copy-answer="${q.id}">复制答案</button>
+        </div>
+      </div>`).join("")}
+    </div>`).join("") + `
+    <div class="bank-group">
+      <h3>SVG 动画题 · ${SVG_TASKS.length} 题（AI 视觉裁判按维度评审）</h3>
+      ${SVG_TASKS.map((t) => `<div class="qitem">
+        <div class="qitem-head">
+          <span class="badge">${t.no}</span>
+          <span class="badge">${esc(t.title)}</span>
+          <span class="stars">${starsText(t.stars)}</span>
+          <span class="spacer"></span>
+          <label class="chk tight"><input type="checkbox" data-task="${t.id}" ${S.settings.taskEnabled[t.id] !== false ? "checked" : ""}><span>参与检测</span></label>
+        </div>
+        <div class="qitem-prompt">${esc(t.brief)}</div>
+        <div class="qitem-answer">评分维度：${(t.criteria || []).map(esc).join(" · ")}</div>
+        <div class="qitem-tools">
+          <button class="btn tiny" data-copy-task="${t.id}">复制完整提示词</button>
+        </div>
+      </div>`).join("")}
+    </div>`;
+  el.querySelectorAll("[data-copy-prompt]").forEach((b) => b.addEventListener("click", () => {
+    const q = qById(b.dataset.copyPrompt);
+    copyText(q.prompt, q.id);
+  }));
+  el.querySelectorAll("[data-copy-answer]").forEach((b) => b.addEventListener("click", () => {
+    const q = qById(b.dataset.copyAnswer);
+    copyText(q.answer, q.id);
+  }));
+  el.querySelectorAll("[data-copy-task]").forEach((b) => b.addEventListener("click", () => {
+    const t = taskById(b.dataset.copyTask);
+    copyText(buildSvgPrompt(t), t.title);
+  }));
+  el.querySelectorAll("[data-task]").forEach((cb) => cb.addEventListener("change", () => {
+    S.settings.taskEnabled[cb.dataset.task] = cb.checked;
+    storeSave("settings", S.settings);
+    renderBankCount();
+  }));
+}
+
+// ==================== 端点编辑 ====================
+const SEL = { set: new Set(), extra: "" };
+function providerForm(p) {
+  const pulled = [...new Set(p.models || [])].sort();
+  const sel = new Set(p.selModels || []);
+  const extra = (p.selModels || []).filter((m) => !pulled.includes(m));
+  SEL.set = new Set([...sel].filter((m) => pulled.includes(m)));
+  SEL.extra = extra.join("\n");
+  return `
+    <div class="grid2">
+      <div class="field"><label>名称</label><input id="f_name" value="${esc(p.name || "")}" placeholder="例如：主力中转·A"></div>
+      <div class="field"><label>协议类型</label><select id="f_type" class="select">
+        ${TYPES.map((t) => `<option value="${t.value}" ${p.type === t.value ? "selected" : ""}>${t.label}</option>`).join("")}
+      </select></div>
+    </div>
+    <div class="field" style="margin-top:12px">
+      <label>BaseURL</label>
+      <div class="row-inline">
+        <input id="f_base" value="${esc(p.baseUrl || "")}" placeholder="https://host/v1">
+        <button class="btn tiny" id="f_fetch" type="button">拉取模型</button>
+      </div>
+      <div class="sub">只写域名会自动补 /v1；粘成 /chat/completions 也会自动纠正。</div>
+    </div>
+    <div class="field" style="margin-top:12px">
+      <label>API Key</label>
+      <div class="row-inline">
+        <input id="f_key" type="password" value="${esc(p.apiKey || "")}" placeholder="sk-...">
+        <button class="btn tiny" id="f_eye" type="button">显示</button>
+        <button class="btn tiny" id="f_clip" type="button">识别剪贴板</button>
+      </div>
+    </div>
+    <label class="chk" style="margin-top:12px"><input type="checkbox" id="f_enabled" ${p.enabled !== false ? "checked" : ""}><span>启用该端点</span></label>
+    <div class="field" style="margin-top:12px">
+      <label>测试模型 <span class="badge" id="f_selcount">0</span></label>
+      <input id="f_search" placeholder="搜索模型…" ${pulled.length ? "" : "disabled"}>
+      <div class="model-list" id="f_modellist">
+        ${pulled.length ? pulled.map((m) => `<label class="model-row" data-m="${esc(m.toLowerCase())}">
+          <input type="checkbox" data-model="${esc(m)}" ${SEL.set.has(m) ? "checked" : ""}><span class="mn">${esc(m)}</span></label>`).join("")
+          : `<div class="empty-sm">还没拉取到模型 · 点「拉取模型」</div>`}
+      </div>
+      <label class="sub" style="display:block;margin-top:8px">手动补充模型（每行一个）</label>
+      <textarea id="f_selmodels" style="min-height:56px">${esc(extra.join("\n"))}</textarea>
+      <div class="sub">不勾不填 = 自动取前 2 个模型。</div>
+    </div>`;
+}
+function refreshSelCount() {
+  const n = SEL.set.size + SEL.extra.split(/\r?\n/).map((s) => s.trim()).filter(Boolean).length;
+  const el = $("#f_selcount");
+  if (el) el.textContent = n;
+}
+function bindModelList() {
+  const list = $("#f_modellist");
+  if (!list) return;
+  list.querySelectorAll("input[data-model]").forEach((cb) => {
+    cb.addEventListener("change", () => {
+      if (cb.checked) SEL.set.add(cb.dataset.model); else SEL.set.delete(cb.dataset.model);
+      refreshSelCount();
+    });
+  });
+  refreshSelCount();
+}
+function renderFormModels(models) {
+  const list = [...new Set(models)].sort();
+  const box = $("#f_modellist");
+  if (box) {
+    box.innerHTML = list.length
+      ? list.map((m) => `<label class="model-row" data-m="${esc(m.toLowerCase())}">
+          <input type="checkbox" data-model="${esc(m)}" ${SEL.set.has(m) ? "checked" : ""}><span class="mn">${esc(m)}</span></label>`).join("")
+      : `<div class="empty-sm">该端点没有返回任何模型</div>`;
+  }
+  const s = $("#f_search");
+  if (s) s.disabled = !list.length;
+  bindModelList();
+}
+function editProvider(id) {
+  const p = S.providers.find((x) => x.id === id);
+  if (!p) return;
+  showModal(`编辑端点 · ${p.name || "(未命名)"}`, providerForm(p), [
+    { label: "取消", fn: hideModal },
+    { label: "保存", cls: "primary", fn: () => saveProvider(id) },
+  ]);
+  bindModelList();
+  const typeSel = $("#f_type");
+  if (typeSel) typeSel.addEventListener("change", (e) => {
+    const base = $("#f_base");
+    if (base && !base.value.trim()) { const a = ADAPTERS[e.target.value]; if (a && a.defaultBase) base.value = a.defaultBase(); }
+  });
+  const fetchBtn = $("#f_fetch");
+  if (fetchBtn) fetchBtn.addEventListener("click", async () => {
+    const type = $("#f_type").value;
+    const baseUrl = normalizeBase($("#f_base").value.trim(), type);
+    const apiKey = $("#f_key").value.trim();
+    if (!baseUrl) { toast("先填 BaseURL", "bad"); return; }
+    fetchBtn.disabled = true; fetchBtn.textContent = "拉取中…";
+    try {
+      const models = await listModels({ type, baseUrl, apiKey }, { timeoutMs: 15000 });
+      p.models = models;
+      await storeSave("providers", S.providers);
+      renderFormModels(models);
+      renderProviders(); renderJudgeSelect();
+      toast(`获取到 ${models.length} 个模型`, "ok");
+    } catch (e) { toast("拉取失败：" + e.message, "bad"); }
+    finally { fetchBtn.disabled = false; fetchBtn.textContent = "拉取模型"; }
+  });
+  const search = $("#f_search");
+  if (search) search.addEventListener("input", (e) => {
+    const kw = e.target.value.trim().toLowerCase();
+    $("#f_modellist").querySelectorAll(".model-row").forEach((row) => {
+      row.style.display = !kw || row.dataset.m.includes(kw) ? "" : "none";
+    });
+  });
+  const extraTa = $("#f_selmodels");
+  if (extraTa) extraTa.addEventListener("input", (e) => { SEL.extra = e.target.value; refreshSelCount(); });
+  const eye = $("#f_eye");
+  if (eye) eye.addEventListener("click", () => {
+    const el = $("#f_key");
+    const show = el.type === "password";
+    el.type = show ? "text" : "password";
+    eye.textContent = show ? "隐藏" : "显示";
+  });
+  const clip = $("#f_clip");
+  if (clip) clip.addEventListener("click", async () => {
+    const txt = await clipRead();
+    const conn = parseConnText(txt);
+    if (!conn) { toast("剪贴板里没识别到连接信息", "bad"); return; }
+    if (conn.baseUrl) $("#f_base").value = conn.baseUrl;
+    if (conn.apiKey) $("#f_key").value = conn.apiKey;
+    if (conn.type) $("#f_type").value = conn.type;
+    if (conn.name && !$("#f_name").value) $("#f_name").value = conn.name;
+    toast("已填入连接信息", "ok");
+  });
+}
+function saveProvider(id) {
+  const p = S.providers.find((x) => x.id === id);
+  if (!p) return;
+  const nm = $("#f_name").value.trim();
+  const rawBase = $("#f_base").value.trim();
+  if (!nm || !rawBase) { toast("名称和 BaseURL 必填", "bad"); return; }
+  p.name = nm;
+  p.type = $("#f_type").value;
+  p.baseUrl = normalizeBase(rawBase, p.type);
+  p.apiKey = $("#f_key").value.trim();
+  p.enabled = $("#f_enabled").checked;
+  const extraTa = $("#f_selmodels");
+  const extra = (extraTa ? extraTa.value : "").split(/\r?\n/).map((s) => s.trim()).filter(Boolean);
+  p.selModels = [...new Set([...SEL.set, ...extra])];
+  hideModal();
+  storeSave("providers", S.providers);
+  renderAll();
+  renderJudgeSelect();
+  toast(`已保存 ${p.name}`, "ok");
+}
+function addProvider() {
+  const p = { id: uid(), name: "", type: "openai", baseUrl: "", apiKey: "", enabled: true, models: [], selModels: [] };
+  S.providers.push(p);
+  storeSave("providers", S.providers);
+  renderProviders();
+  editProvider(p.id);
+  setTimeout(async () => {
+    const txt = await clipRead();
+    const conn = parseConnText(txt);
+    if (conn) toast(`剪贴板识别到：${conn.name || conn.baseUrl}，可点「识别剪贴板」填入`, "ok");
+  }, 260);
+}
+function delProvider(id) {
+  const p = S.providers.find((x) => x.id === id);
+  if (!p) return;
+  if (!confirm(`删除端点「${p.name}」？`)) return;
+  S.providers = S.providers.filter((x) => x.id !== id);
+  storeSave("providers", S.providers);
+  renderAll();
+  renderJudgeSelect();
+}
+async function fetchModelsFor(id) {
+  const p = S.providers.find((x) => x.id === id);
+  if (!p) return;
+  if (!p.baseUrl) { toast("该端点没有 BaseURL", "bad"); return; }
+  try {
+    const models = await listModels(p, { timeoutMs: 15000 });
+    p.models = models;
+    await storeSave("providers", S.providers);
+    renderAll();
+    renderJudgeSelect();
+    toast(`${p.name}：获取到 ${models.length} 个模型`, "ok");
+  } catch (e) { toast(`获取失败：${e.message}`, "bad"); }
+}
+function providerMenu(id, e) {
+  const p = S.providers.find((x) => x.id === id);
+  if (!p) return;
+  menuAt(e, p.name || "端点", [
+    { label: "编辑端点…", fn: () => editProvider(id) },
+    { label: "拉取模型列表", hint: (p.models || []).length ? p.models.length + " 个" : "", fn: () => fetchModelsFor(id) },
+    { label: (p.enabled === false ? "启用" : "停用") + "该端点", fn: async () => { p.enabled = p.enabled === false; await storeSave("providers", S.providers); renderAll(); } },
+    { sep: true },
+    cp(p.name, "名称"),
+    cp(p.baseUrl, "BaseURL"),
+    cp(p.apiKey, "API Key"),
+    { label: "复制连接配置（URL + Key）", fn: () => copyText(`${p.baseUrl}\n${p.apiKey || ""}`, "连接配置") },
+    { label: "复制模型列表", disabled: !(p.models || []).length, fn: () => copyText((p.models || []).join("\n"), (p.models || []).length + " 个模型") },
+    { sep: true },
+    { label: "删除端点", kind: "danger", fn: () => delProvider(id) },
+  ]);
+}
+
+// ==================== 报告 / 分享 ====================
+function exportCsv() {
+  const run = currentRun();
+  if (!run) { toast("还没有可导出的结果", "bad"); return; }
+  const name = `iq-report-${new Date(run.ts).toISOString().slice(0, 19).replace(/[T:]/g, "-")}.csv`;
+  saveFile(name, buildReportCsv(run));
+}
+function shareModal() {
+  const run = currentRun();
+  if (!run) { toast("还没有可分享的结果", "bad"); return; }
+  const text = buildShareText(run);
+  showModal("分享报告",
+    `<textarea id="shareText" style="width:100%;min-height:320px;font-family:var(--mono);font-size:12px">${esc(text)}</textarea>`,
+    [
+      { label: "保存 .md", fn: () => saveFile(`iq-share-${new Date(run.ts).toISOString().slice(0, 10)}.md`, text) },
+      { label: "导出 CSV", fn: exportCsv },
+      { label: "复制到剪贴板", cls: "primary", fn: () => copyText(text, "分享报告") },
+    ]);
+}
+
+// ==================== 渲染汇总 / 初始化 ====================
+function renderTopStats() {
+  const el = $("#topStats");
+  if (!el) return;
+  const run = currentRun();
+  if (!run) { el.innerHTML = `<span>端点 <b>${S.providers.length}</b></span><span>等待首次检测</span>`; return; }
+  const st = runStats(run);
+  el.innerHTML = `<span>端点 <b>${run.providerCount ?? S.providers.length}</b></span>` +
+    `<span>学科题 <b class="${(st.qRate ?? 0) >= 60 ? "good" : "bad"}">${st.qRate == null ? "—" : st.qRate + "%"}</b></span>` +
+    `<span>SVG <b>${st.svgTotal || 0}</b></span>` +
+    `<span>上次 <b>${hhmmss(run.ts)}</b></span>`;
+}
+function renderAll() {
+  renderTopStats();
+  renderProviders();
+  renderQList();
+  renderJudgeSelect();
+  renderResults();
+  renderGallery();
+  renderBank();
+  renderTimeline();
+  renderGen();
+}
+
 function bindStatic() {
-  $("#btnRunQuick").addEventListener("click", () => runBattery(false));
-  $("#btnRunFull").addEventListener("click", () => runBattery(true));
+  $("#btnRun").addEventListener("click", runAll);
   $("#btnStop").addEventListener("click", stopRun);
-  $("#btnImport").addEventListener("click", importModal);
-  $("#btnAddProv").addEventListener("click", addProv);
+  $("#btnShare").addEventListener("click", shareModal);
   $("#themeToggle").addEventListener("click", cycleTheme);
-  $("#modal").addEventListener("click", (e) => { if (e.target === $("#modal")) hideModal(); });
-  document.addEventListener("keydown", (e) => {
-    if (e.key === "Escape") { hideModal(); closeMenu(); closeConnTip(); }
+  $("#btnAddProv").addEventListener("click", addProvider);
+  $("#btnFetchProv").addEventListener("click", async () => {
+    for (const p of S.providers) await fetchModelsFor(p.id);
+    if (!S.providers.length) toast("先添加端点", "bad");
+  });
+  $("#selAllQ").addEventListener("change", (e) => {
+    QUESTIONS.forEach((q) => { S.settings.qEnabled[q.id] = e.target.checked; });
+    storeSave("settings", S.settings);
+    renderQList();
+  });
+  const bindNum = (id, key, min, max) => {
+    const el = $(id);
+    if (!el) return;
+    el.value = S.settings[key];
+    el.addEventListener("change", () => {
+      const v = Number(el.value);
+      if (Number.isFinite(v)) S.settings[key] = Math.max(min, Math.min(max, v));
+      el.value = S.settings[key];
+      storeSave("settings", S.settings);
+    });
+  };
+  bindNum("#cfgConc", "concurrency", 1, 16);
+  bindNum("#cfgTimeout", "timeoutSec", 10, 600);
+  bindNum("#cfgMaxTok", "maxTokens", 256, 32768);
+  bindNum("#cfgRetries", "retries", 0, 5);
+  const jEl = $("#cfgJudge");
+  jEl.checked = S.settings.judgeOn;
+  jEl.addEventListener("change", (e) => { S.settings.judgeOn = e.target.checked; storeSave("settings", S.settings); });
+  const sEl = $("#cfgSvgOn");
+  sEl.checked = S.settings.svgOn;
+  sEl.addEventListener("change", (e) => { S.settings.svgOn = e.target.checked; storeSave("settings", S.settings); renderBankCount(); });
+  $("#cfgJudgeModel").addEventListener("change", (e) => {
+    S.settings.judgeModel = e.target.value;
+    storeSave("settings", S.settings);
+    renderJudgeSelect();
+  });
+  const fl = $("#followLog");
+  fl.checked = S.settings.followLog;
+  fl.addEventListener("change", (e) => { S.settings.followLog = e.target.checked; storeSave("settings", S.settings); });
+
+  document.querySelectorAll("#tabs button").forEach((b) => {
+    b.addEventListener("click", () => {
+      document.querySelectorAll("#tabs button").forEach((x) => x.classList.remove("active"));
+      b.classList.add("active");
+      S.tab = b.dataset.tab;
+      ["monitor", "results", "gallery", "bank"].forEach((t) => $("#view-" + t).classList.toggle("hidden", t !== S.tab));
+      if (S.tab === "results") renderResults();
+      if (S.tab === "gallery") renderGallery();
+      if (S.tab === "bank") renderBank();
+    });
   });
 
-  // 右键：空白处给通用菜单；输入框放行（保留原生剪贴板菜单）
+  $("#modal").addEventListener("click", (e) => { if (e.target === $("#modal")) hideModal(); });
+  document.addEventListener("keydown", (e) => { if (e.key === "Escape") { hideModal(); closeMenu(); } });
   document.addEventListener("contextmenu", (e) => {
     const t = e.target;
     const tag = (t && t.tagName) || "";
@@ -2094,88 +1224,71 @@ function bindStatic() {
     if (e.defaultPrevented) return;
     e.preventDefault();
     openMenu(e.clientX, e.clientY, "操作", [
-      { label: "识别剪贴板连接信息", fn: () => tryClipboardIntoForm({ manual: true }) },
-      { label: "添加端点", fn: addProv },
-      { label: "批量导入", fn: importModal },
+      { label: "开始检测", fn: runAll },
+      { label: "停止", disabled: !S.running, fn: stopRun },
       { sep: true },
-      { label: "快速检测", fn: () => runBattery(false) },
-      { label: (S.settings.tests.concur ? "关闭并发" : "打开并发") + "开关", fn: () => toggleConcur(!S.settings.tests.concur) },
+      { label: "添加端点", fn: addProvider },
+      { label: "导出报告 CSV", fn: exportCsv },
+      { label: "生成分享报告", fn: shareModal },
       { sep: true },
-      { label: "导出报告表格（CSV）", fn: () => exportReportCsv(null) },
-      { label: "导出本表格（CSV）", fn: () => exportCsv() },
-      { label: "打开数据目录", fn: openDir },
-      { sep: true },
-      { label: "切换主题（跟随系统/浅色/深色）", fn: cycleTheme },
+      { label: "切换主题", fn: cycleTheme },
+      { label: "打开数据目录", fn: () => invoke("openDataDir") },
     ]);
   });
-  // 点别处 / 滚动 / 失焦 → 关菜单（点菜单内部不关，交给菜单项自己处理）
-  document.addEventListener("click", (e) => {
-    if (!_menuEl) return;
-    if (_menuEl.contains(e.target)) return;
-    closeMenu();
-  }, true);
+  document.addEventListener("click", (e) => { if (_menuEl && !_menuEl.contains(e.target)) closeMenu(); }, true);
   window.addEventListener("blur", () => closeMenu());
   document.addEventListener("scroll", () => closeMenu(), true);
-
-  document.querySelectorAll(".tabs button").forEach((b) => {
-    b.addEventListener("click", () => {
-      document.querySelectorAll(".tabs button").forEach((x) => x.classList.remove("active"));
-      b.classList.add("active");
-      S.tab = b.dataset.tab;
-      ["dash", "records", "history", "config"].forEach((t) => {
-        $("#view-" + t).classList.toggle("hidden", t !== S.tab);
-      });
-      if (S.tab === "dash") { renderVitals(); renderCharts(); }
-      if (S.tab === "records") renderRecords();
-      if (S.tab === "history") renderHistory();
-      if (S.tab === "config") renderConfig();
-    });
-  });
-
-  window.addEventListener("resize", () => {
-    Object.values(charts).forEach((c) => { try { c.resize(); } catch {} });
-  });
 }
 
-// 模型结果聚合：provider × model 的状态（成功 / 部分成功 / 失败）汇总
-function aggregateModelResults(rows) {
-  const by = new Map();
-  for (const r of rows) {
-    if (!r.model) continue;
-    const k = r.provider + "\u0000" + r.model;
-    const e = by.get(k) || { provider: r.provider, model: r.model, rows: [] };
-    e.rows.push(r);
-    by.set(k, e);
-  }
-  return [...by.values()].map((e) => ({ ...e, stat: modelStat(e.rows) }));
-}
+(async function init() {
+  S.providers = (await storeLoad("providers", [])) || [];
+  const st = (await storeLoad("settings", null)) || {};
+  S.settings = {
+    ...DEFAULT_SETTINGS, ...st,
+    qEnabled: { ...DEFAULT_SETTINGS.qEnabled, ...(st.qEnabled || {}) },
+    taskEnabled: { ...DEFAULT_SETTINGS.taskEnabled, ...(st.taskEnabled || {}) },
+  };
+  S.runs = (await storeLoad("runs", [])) || [];
+  applyTheme();
+  bindStatic();
+  renderAll();
+  setStatus("就绪");
 
-// 全局动作（供内联 onclick 调用）
-window.AH = {
-  saveSettings, addPrompt, delPrompt, openDir, exportConfig, importConfig, clearHistory,
-  addProv, editProv: editProvider, delProv, importModal, setTheme, toggleConcur,
-  exportReport: () => exportReportCsv(null),
-  exportCsv,
-  clearRecords,
-  clearAllHistory,
-  detectClipboard: () => tryClipboardIntoForm({ manual: true }),
-  // 测试钩子：解析任意文本里的连接信息
-  parseConn: parseConnText,
-  buildReport,
-  state: S,
-  viewRun: (ts) => {
-    const r = S.runs.find((x) => x.ts === ts);
-    if (!r) return;
-    S.filterRun = r;
-    S.filter = "all";
-    document.querySelector('.tabs button[data-tab="records"]').click();
-    renderRecords();
-  },
-  delRun: async (ts) => {
-    if (!confirm("删除这条历史？")) return;
-    S.runs = S.runs.filter((x) => x.ts !== ts);
-    if (S.filterRun && S.filterRun.ts === ts) S.filterRun = null;
-    await storeSave("history", S.runs);
+  // e2e 测试钩子：?e2e=1[&base=...][&qs=Q1,Q12][&tasks=svg-ecg]
+  const params = new URLSearchParams(location.search);
+  if (params.get("e2e")) {
+    const base = params.get("base") || "http://127.0.0.1:18099/v1";
+    const pick = (key, all) => {
+      const v = params.get(key);
+      return v ? new Set(v.split(",").filter(Boolean)) : new Set(all);
+    };
+    const qs = pick("qs", QUESTIONS.map((q) => q.id));
+    const tk = pick("tasks", SVG_TASKS.map((t) => t.id));
+    QUESTIONS.forEach((q) => { S.settings.qEnabled[q.id] = qs.has(q.id); });
+    SVG_TASKS.forEach((t) => { S.settings.taskEnabled[t.id] = tk.has(t.id); });
+    S.settings.concurrency = Number(params.get("conc") || 2);
+    S.providers = [{ id: "e2e", name: "E2E·本地mock", type: "openai", baseUrl: base, apiKey: "sk-e2e", enabled: true, models: [], selModels: [] }];
     renderAll();
-  },
+    try {
+      const ms = await listModels(S.providers[0], { timeoutMs: 8000 });
+      S.providers[0].models = ms;
+      S.providers[0].selModels = ms.slice(0, Number(params.get("nmodels") || 1));
+      renderAll();
+    } catch (e) { console.warn("e2e listModels 失败", e); }
+    await runAll();
+    document.documentElement.dataset.e2e = "done";
+  }
+  try {
+    const r = await invoke("sysinfo");
+    if (r && r.ok && r.data) {
+      const info = JSON.parse(r.data);
+      if (info.ver) { const el = $("#verText"); if (el) el.textContent = "v" + info.ver; }
+    }
+  } catch { /* 浏览器模式 */ }
+})();
+
+// 调试入口
+window.AH = {
+  state: S, runAll, stopRun, exportCsv, shareModal, captureFrames, showGen,
+  parseConn: parseConnText, renderAll, questions: QUESTIONS, tasks: SVG_TASKS,
 };

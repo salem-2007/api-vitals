@@ -7,6 +7,10 @@ winapp/dist/
 *.pdb
 *.user
 
+# ---------- Python ----------
+__pycache__/
+*.py[cod]
+
 # ---------- 依赖 ----------
 node_modules/
 *.nuget/
@@ -36,3 +40,6 @@ desktop.ini
 
 # ---------- 截图工作文件（README 引用的成品图在 docs/ 下）----------
 winapp/2026-*.png
+
+# 构建产物与测试截图
+winapp/test/shots/

@@ -1,39 +1,26 @@
-"""生成 app.ico —— 与 UI 主题一致的图标：深色底 + 圆角 + 绿色心电脉冲（◉ API VITALS）
+"""生成 app.ico —— 与 UI 一致的图标：深色圆角底 + 绿色神经元网络（IQ BENCH）
 纯 PIL 绘制，多尺寸打包，供 exe / 任务栏 / 窗口 / favicon 使用。
 用法：python3 tools/make_icon.py
 """
 from PIL import Image, ImageDraw
 import os
 
-# 主题色（与 app.css 深色模式一致）
-BG_TOP = (18, 26, 36)        # panel2
-BG_BOT = (10, 14, 19)        # bg
-SIG = (62, 224, 143)         # --sig 心电绿
-GLOW = (62, 224, 143, 70)
-RING = (42, 55, 74)          # line2
+# 主题色（与 app.css 暗色模式一致）
+BG_TOP = (27, 35, 54)         # --card
+BG_BOT = (12, 17, 29)         # 更深一档
+SIG = (34, 197, 94)           # --accent
+NODE = (134, 239, 172)        # 亮一档的绿
+RING = (71, 85, 105)          # --line2
 
-S = 1024                     # 超采样画布，最后缩到各尺寸，边缘更干净
-
-
-def ecg_points(w, h):
-    """心电波形（相对坐标 0..1），与前端 drawEcg() 的节拍一致"""
-    beat = [
-        (0.00, 0.50), (0.18, 0.50), (0.24, 0.44), (0.28, 0.50),
-        (0.31, 0.50), (0.325, 0.42), (0.34, 0.60),   # Q
-        (0.355, 0.16),                                # R 尖峰
-        (0.37, 0.72),                                 # S 深谷
-        (0.40, 0.50), (0.50, 0.50), (0.56, 0.36),
-        (0.64, 0.50), (1.00, 0.50),                   # T + 回到基线
-    ]
-    return [(x * w, y * h) for x, y in beat]
+S = 1024                      # 超采样画布
 
 
 def build(size):
+    """神经元网络图标：4 个节点 + 3 条连线，代表推理与连接。"""
     img = Image.new("RGBA", (S, S), (0, 0, 0, 0))
     d = ImageDraw.Draw(img)
 
     r = int(S * 0.22)
-    # 垂直渐变底（逐行画，模拟 linear-gradient）
     grad = Image.new("RGBA", (S, S))
     gd = ImageDraw.Draw(grad)
     for y in range(S):
@@ -43,33 +30,32 @@ def build(size):
     mask = Image.new("L", (S, S), 0)
     ImageDraw.Draw(mask).rounded_rectangle([0, 0, S - 1, S - 1], radius=r, fill=255)
     img.paste(grad, (0, 0), mask)
-
-    # 内描边：让图标在深色/浅色任务栏上都有轮廓
     d.rounded_rectangle([3, 3, S - 4, S - 4], radius=r, outline=RING + (220,), width=max(2, S // 170))
 
-    # 心电基线区域
-    pad = int(S * 0.16)
-    w = S - pad * 2
-    h = S - pad * 2
-    pts = [(px + pad, py + pad) for px, py in ecg_points(w, h)]
+    # 节点（相对坐标）：左下 → 中上 → 右下，外加一个输入点
+    pts = [
+        (0.26, 0.68, 0.055),   # 左下
+        (0.50, 0.32, 0.075),   # 中上（主节点）
+        (0.76, 0.66, 0.055),   # 右下
+        (0.50, 0.80, 0.040),   # 底部
+    ]
+    P = [(x * S, y * S, rr * S) for x, y, rr in pts]
+    edges = [(0, 1), (1, 2), (0, 3), (3, 2)]
 
-    # 光晕（粗半透明线打底）
+    # 连线（先画光晕再画实线）
     lay = Image.new("RGBA", (S, S), (0, 0, 0, 0))
     ld = ImageDraw.Draw(lay)
-    lw = int(S * 0.075)
-    ld.line(pts, fill=GLOW, width=lw, joint="curve")
-    lay = lay.filter(__import__("PIL.ImageFilter", fromlist=["ImageFilter"]).GaussianBlur(S * 0.02))
+    for a, b in edges:
+        ld.line([P[a][:2], P[b][:2]], fill=SIG + (150,), width=int(S * 0.022))
+    lay = lay.filter(__import__("PIL.ImageFilter", fromlist=["ImageFilter"]).GaussianBlur(S * 0.012))
     img.alpha_composite(lay)
+    for a, b in edges:
+        d.line([P[a][:2], P[b][:2]], fill=SIG + (255,), width=max(3, int(S * 0.014)))
 
-    # 主波形 + 圆头端点
-    lw2 = max(3, int(S * 0.042))
-    d.line(pts, fill=SIG + (255,), width=lw2, joint="curve")
-    cap = lw2 // 2
-    for p in (pts[0], pts[-1]):
-        d.ellipse([p[0] - cap, p[1] - cap, p[0] + cap, p[1] + cap], fill=SIG + (255,))
-    # 左上角小圆点（◉ 品牌符号）
-    bx, by, br = int(S * 0.27), int(S * 0.27), int(S * 0.038)
-    d.ellipse([bx - br, by - br, bx + br, by + br], outline=SIG + (255,), width=max(2, S // 200))
+    # 节点圆点：外圈 + 实心
+    for x, y, rr in P:
+        d.ellipse([x - rr, y - rr, x + rr, y + rr], fill=NODE + (255,))
+        d.ellipse([x - rr * 0.45, y - rr * 0.45, x + rr * 0.45, y + rr * 0.45], fill=SIG + (255,))
 
     return img.resize((size, size), Image.LANCZOS)
 

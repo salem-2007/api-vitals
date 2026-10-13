@@ -1,109 +1,153 @@
-// audit.mjs — 读关键元素的计算样式（字体是否生效 / 对比度 / 浮层定位），并裁局部截图
-// 自带静态服务，跨平台（WSL / Linux CI）
-// 用法：node test/audit.mjs
-import { writeFileSync } from "node:fs";
-import {
-  startStatic, launchAndAttach, waitLoaded, killBrowser, closeServer, sleep, log,
-} from "./harness.mjs";
+// audit.mjs — UI 审计：对比度 / 焦点可见 / 减弱动效 / 横向滚动 / 触达尺寸 / 图表可访问性
+// 依据 ui-ux-pro-max 预交付清单（contrast-text-4.5、visible-focus、reduced-motion、web-target-size）
+import { fileURLToPath } from "node:url";
+import { dirname, join } from "node:path";
+import { mkdirSync } from "node:fs";
+import { startMock } from "./mock-api.mjs";
+import { launch, newPage, close } from "./cdp.mjs";
 
-const PORT = Number(process.env.APP_PORT || 18099);
-const APP = `http://127.0.0.1:${PORT}/index.html`;
-const CDP = 9700 + Math.floor(Math.random() * 200);
-const PROFILE_PREFIX = "edge-audit";
+const here = dirname(fileURLToPath(import.meta.url));
+const root = join(here, "..", "wwwroot");
+const shots = join(here, "shots");
+mkdirSync(shots, { recursive: true });
 
-const server = await startStatic(PORT);
-const { cdp, proc } = await launchAndAttach({
-  port: CDP, url: APP, profilePrefix: PROFILE_PREFIX, extraArgs: ["--window-size=1440,900"],
-});
+let pass = 0, fail = 0;
+const t = (n, c, info = "") => { if (c) pass++; else { fail++; console.log("  ✗ " + n + (info ? "  → " + info : "")); } };
 
-cdp.shot = async function (path, clip) {
-  const p = { format: "png" };
-  if (clip) p.clip = { ...clip, scale: 1 };
-  const r = await this.send("Page.captureScreenshot", p);
-  writeFileSync(path, Buffer.from(r.result.data, "base64"));
-  log("  shot ->", path);
+const { QUESTIONS } = await import("../wwwroot/questions.js");
+const answers = {};
+for (const q of QUESTIONS) answers[q.prompt] = q.answer;
+
+const mock = await startMock({ root, answers });
+const ctx = await launch({ headless: true, width: 1440, height: 900 });
+const page = await newPage(ctx);
+
+// 在页面里注入对比度计算工具
+const AUDIT_JS = `
+window.__contrast = () => {
+  const lum = (rgb) => {
+    const [r, g, b] = rgb.map((v) => { v /= 255; return v <= 0.03928 ? v / 12.92 : Math.pow((v + 0.055) / 1.055, 2.4); });
+    return 0.2126 * r + 0.7152 * g + 0.0722 * b;
+  };
+  const parse = (c) => {
+    const m = String(c).match(/rgba?\\(([^)]+)\\)/);
+    if (!m) return null;
+    const p = m[1].split(",").map((x) => parseFloat(x));
+    return { rgb: [p[0], p[1], p[2]], a: p.length > 3 ? p[3] : 1 };
+  };
+  const bgOf = (el) => {
+    let node = el;
+    while (node && node !== document.documentElement) {
+      const c = parse(getComputedStyle(node).backgroundColor);
+      if (c && c.a > 0.6) return c.rgb;
+      node = node.parentElement;
+    }
+    return [15, 23, 42];
+  };
+  const ratio = (fg, bg) => {
+    const l1 = lum(fg), l2 = lum(bg);
+    const hi = Math.max(l1, l2), lo = Math.min(l1, l2);
+    return Math.round(((hi + 0.05) / (lo + 0.05)) * 100) / 100;
+  };
+  const probe = (sel, label) => {
+    const el = document.querySelector(sel);
+    if (!el) return { label, missing: true };
+    const fg = parse(getComputedStyle(el).color);
+    const bg = bgOf(el);
+    return { label, sel, size: parseFloat(getComputedStyle(el).fontSize), ratio: fg ? ratio(fg.rgb, bg) : null };
+  };
+  return [
+    probe(".statusbar .run", "状态栏文字"),
+    probe("#view-results .card-row span", "卡片标签"),
+    probe("#view-results .sub", "次要文字"),
+    probe("#view-monitor .tl-text", "时间轴正文"),
+    probe("#view-monitor .tl-sub", "时间轴次要"),
+    probe("th", "表头"),
+    probe("#qList label span:last-child", "题库条目"),
+    probe(".btn.tiny", "小按钮"),
+    probe(".badge", "徽标"),
+  ];
 };
+window.__hscroll = () => document.documentElement.scrollWidth - document.documentElement.clientWidth;
+window.__smallTargets = () => [...document.querySelectorAll("button")]
+  .filter((b) => { const r = b.getBoundingClientRect(); return r.width > 0 && (r.height < 24 || r.width < 24); })
+  .map((b) => (b.textContent || "").trim().slice(0, 12) + " " + Math.round(b.getBoundingClientRect().width) + "x" + Math.round(b.getBoundingClientRect().height));
+`;
 
 try {
-  const ok = await waitLoaded(cdp, `http://127.0.0.1:${PORT}`, { appUrl: APP });
-  if (!ok) throw new Error("页面未导航到 app 源");
-  // 等字体加载完（font-display: swap）
-  await cdp.ev(`document.fonts.ready.then(() => true)`);
-  await sleep(1200);
+  const url = `http://127.0.0.1:${mock.port}/index.html?e2e=1&base=${encodeURIComponent(`http://127.0.0.1:${mock.port}/v1`)}&qs=Q1,Q12,Q22&tasks=svg-ecg&nmodels=1&conc=1`;
+  await page.goto(url);
+  await page.waitFor(`document.documentElement.dataset.e2e === "done"`, 90000);
+  await page.eval(AUDIT_JS);
+  // 打开成绩单，保证被审计的元素都在
+  await page.eval(`document.querySelector('#tabs button[data-tab="results"]').click()`);
+  await page.eval("new Promise(r=>setTimeout(r,300))");
 
-  // 先种一个端点，才能测右键菜单；并强制深色主题
-  await cdp.ev(`(() => {
-    localStorage.setItem("ah_providers", JSON.stringify([
-      { id:"a1", name:"主力中转", type:"openai", baseUrl:"https://api.example.com/v1", apiKey:"sk-xxxxxxxxxxxx", enabled:true, models:["m1","m2"], selModels:["m1"] }
-    ]));
-    localStorage.setItem("ah_settings", JSON.stringify({ timeoutMs:20000, timeoutMs2:0, connectTimeoutMs:8000, latencyN:3, concurN:2, gapMs:0, theme:"dark", recordLimit:300, tests:{connect:true,latency:true,stream:true,tps:true,concur:false} }));
-    localStorage.removeItem("ah_history");
-    return "seeded";
-  })()`);
-  await cdp.send("Page.reload");
-  await cdp.ev(`document.fonts.ready.then(() => true)`);
-  await sleep(2000);
-  await cdp.ev(`AH && AH.setTheme && AH.setTheme('dark'); "dark"`);
-  await sleep(800);
-
-  const audit = await cdp.ev(`(() => {
-    // 颜色统一成 rgb() 再算 WCAG 对比度
-    const norm = (c) => { const d = document.createElement('div'); d.style.color = c; document.body.appendChild(d); const v = getComputedStyle(d).color; d.remove(); return v; };
-    const lum = (rgb) => { const m = String(rgb).match(/[\\d.]+/g); if (!m || m.length < 3) return null;
-      const f = m.slice(0,3).map(Number).map(v => { v/=255; return v<=0.03928 ? v/12.92 : Math.pow((v+0.055)/1.055, 2.4); });
-      return 0.2126*f[0]+0.7152*f[1]+0.0722*f[2]; };
-    const ratio = (a,b) => { const l1=lum(a), l2=lum(b); if (l1==null||l2==null) return null;
-      return +(((Math.max(l1,l2)+0.05)/(Math.min(l1,l2)+0.05)).toFixed(2)); };
-    const cs = (sel, prop) => { const el = document.querySelector(sel); return el ? getComputedStyle(el)[prop] : null; };
-    const box = (sel) => { const el = document.querySelector(sel); if (!el) return null; const r = el.getBoundingClientRect(); return { x:r.x|0, y:r.y|0, w:r.width|0, h:r.height|0 }; };
-    const bgVar = getComputedStyle(document.documentElement).getPropertyValue('--bg').trim();
-    const textCol = getComputedStyle(document.querySelector('.vit .vrow b') || document.body).color;
-    const mutedCol = getComputedStyle(document.querySelector('.vit .vrow span') || document.body).color;
-    return {
-      theme: document.documentElement.dataset.theme,
-      fontFamilyBody: cs('body','fontFamily'),
-      fontReady: document.fonts.status,
-      faces: [...document.fonts].map(f => f.family + '/' + f.status),
-      // 宽度差异法：内置字体是否真的参与了渲染
-      widthTest: (() => { const mk = (ff) => { const d=document.createElement('span');
-        d.style.cssText='position:absolute;visibility:hidden;font-size:40px;white-space:nowrap;font-family:'+ff;
-        d.textContent='测试字体 ABC 123'; document.body.appendChild(d);
-        const w=d.getBoundingClientRect().width; d.remove(); return +w.toFixed(1); };
-        return { app: mk('"App Round"'), missing: mk('"NoSuchFontXYZ"'), sys: mk('system-ui') }; })(),
-      ecgBg: cs('.ecg','backgroundColor'),
-      ecgBorder: cs('.ecg','borderTopWidth') + ' ' + cs('.ecg','borderTopColor'),
-      ecgBox: box('.ecg'),
-      hudAfterContent: getComputedStyle(document.querySelector('.hud'),'::after').content,
-      bodyText: getComputedStyle(document.body).color,
-      textCol, mutedCol,
-      contrast: { textVsBg: ratio(textCol, norm(bgVar)), mutedVsBg: ratio(mutedCol, norm(bgVar)) },
-      bodyBg: getComputedStyle(document.body).backgroundColor,
-    };
-  })()`);
-  console.log(JSON.stringify(audit, null, 2));
-
-  // 弹右键菜单，检查定位方式（必须是 fixed）
-  const menu = await cdp.ev(`(() => {
-    const el = document.querySelector('#providers .prov');
-    if (!el) return { err: 'no prov' };
-    el.dispatchEvent(new MouseEvent('contextmenu', { bubbles: true, clientX: 260, clientY: 300 }));
-    const m = document.querySelector('.ctxmenu');
-    if (!m) return { err: 'no menu' };
-    const r = m.getBoundingClientRect();
-    return { position: getComputedStyle(m).position, x: r.x|0, y: r.y|0, w: r.width|0, h: r.height|0,
-             left: getComputedStyle(m).left, top: getComputedStyle(m).top, items: m.querySelectorAll('.ctx-item').length };
-  })()`);
-  console.log("MENU " + JSON.stringify(menu));
-  if (menu && !menu.err) {
-    await cdp.shot("/tmp/audit-menu.png", { x: Math.max(0, menu.x - 40), y: Math.max(0, menu.y - 40), width: menu.w + 80, height: menu.h + 80 });
+  for (const theme of ["dark", "light"]) {
+    await page.eval(`document.documentElement.dataset.theme = "${theme}"; window.AH.state.settings.theme="${theme}";`);
+    await page.eval("new Promise(r=>setTimeout(r,200))");
+    const rows = await page.eval("window.__contrast()");
+    for (const r of rows) {
+      if (r.missing) { t(`${theme} · ${r.label} 存在`, false, "元素缺失 " + r.sel); continue; }
+      const min = r.size >= 24 || (r.size >= 18.66 && false) ? 3 : 4.5;
+      t(`${theme} · ${r.label} 对比度 ≥ ${min}`, r.ratio >= min, `ratio=${r.ratio} size=${r.size}px`);
+    }
   }
 
-  const eb = audit.ecgBox;
-  if (eb) await cdp.shot("/tmp/audit-ecg.png", { x: Math.max(0, eb.x - 30), y: 0, width: Math.min(1400, eb.w + 380), height: 80 });
+  // 焦点可见（用真实 Tab 键，才能触发 :focus-visible）
+  await page.send("Runtime.evaluate", { expression: "document.body.focus()" });
+  for (let i = 0; i < 3; i++) {
+    await page.send("Input.dispatchKeyEvent", { type: "rawKeyDown", windowsVirtualKeyCode: 9, key: "Tab" });
+    await page.send("Input.dispatchKeyEvent", { type: "keyUp", windowsVirtualKeyCode: 9, key: "Tab" });
+  }
+  const focus = await page.eval(`(()=>{const el=document.activeElement;const s=getComputedStyle(el);return {tag:el.tagName,text:(el.textContent||'').trim().slice(0,10),w:s.outlineWidth,style:s.outlineStyle};})()`);
+  t("键盘焦点有可见外框", focus.style !== "none" && parseFloat(focus.w) >= 2, JSON.stringify(focus));
+
+  // 减弱动效
+  await ctx.proc && null;
+  await page.send("Emulation.setEmulatedMedia", { features: [{ name: "prefers-reduced-motion", value: "reduce" }] });
+  const rm = await page.eval(`(()=>{const el=document.querySelector('.lamp.busy')||document.querySelector('.btn');const s=getComputedStyle(el);return s.animationDuration+"|"+s.transitionDuration;})()`);
+  const rmOk = rm.split("|").every((d) => parseFloat(d) <= 0.001);
+  t("减弱动效生效", rmOk, rm);
+  await page.send("Emulation.setEmulatedMedia", { features: [] });
+
+  // 横向滚动（两种宽度）
+  for (const w of [1440, 1024, 768]) {
+    await page.send("Emulation.setDeviceMetricsOverride", { width: w, height: 900, deviceScaleFactor: 1, mobile: false });
+    await page.eval("new Promise(r=>setTimeout(r,250))");
+    const hs = await page.eval("window.__hscroll()");
+    t(`无横向滚动 @${w}px`, hs <= 1, "overflow=" + hs);
+  }
+  await page.send("Emulation.clearDeviceMetricsOverride");
+
+  // 触达尺寸
+  await page.send("Emulation.setDeviceMetricsOverride", { width: 1440, height: 900, deviceScaleFactor: 1, mobile: false });
+  const small = await page.eval("window.__smallTargets()");
+  t("按钮触达尺寸 ≥24px", small.length === 0, small.slice(0, 5).join(" | "));
+  await page.send("Emulation.clearDeviceMetricsOverride");
+
+  // 图表可访问性
+  const chart = await page.eval(`(()=>{const s=document.querySelector('#view-results svg[role=img]');return s?{label:s.getAttribute('aria-label'),w:s.getBoundingClientRect().width}:null;})()`);
+  t("图表有 aria-label", chart && chart.label && chart.w > 100, JSON.stringify(chart));
+
+  // 键盘可达：Tab 能到主按钮
+  const tabbable = await page.eval(`[...document.querySelectorAll('button, input, select, textarea, [tabindex]')].filter(e=>!e.disabled && e.offsetParent!==null).length`);
+  t("可键盘聚焦控件充足", tabbable > 20, "count=" + tabbable);
+
+  // 截图留档
+  await page.screenshot(join(shots, "audit-dark.png"));
+  await page.eval(`document.documentElement.dataset.theme = "light"`);
+  await page.eval("new Promise(r=>setTimeout(r,300))");
+  await page.screenshot(join(shots, "audit-light.png"));
 } catch (e) {
-  console.log("FAIL " + e.message);
+  fail++;
+  console.log("  ✗ 审计异常: " + (e && e.message));
+  try { await page.screenshot(join(shots, "audit-fail.png")); } catch { /* noop */ }
 } finally {
-  await killBrowser(proc, PROFILE_PREFIX);
-  closeServer(server);
-  try { cdp?.ws.close(); } catch {}
+  page.close();
+  await close(ctx);
+  mock.close();
 }
+
+console.log(`\n审计结果：${pass} 通过 / ${fail} 失败`);
+process.exit(fail ? 1 : 0);

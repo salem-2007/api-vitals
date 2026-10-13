@@ -1,4 +1,5 @@
 // Program.cs — 原生窗口壳：WinForms + WebView2（内嵌渲染，不弹浏览器）
+// 模型智商检测：开窗 / 嵌 WebView / 本地 JSON 读写桥 / 剪贴板 / 日志
 // 职责只有四件事：开窗、嵌 WebView、本地 JSON 读写桥、日志。
 using System.Diagnostics;
 using System.Reflection;
@@ -9,7 +10,7 @@ using Microsoft.Win32;
 using Microsoft.Web.WebView2.Core;
 using Microsoft.Web.WebView2.WinForms;
 
-namespace ApiHealth;
+namespace IQBench;
 
 static class Program
 {
@@ -101,7 +102,7 @@ static class Program
     }
 
     static string DataDir =>
-        Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "ApiHealth");
+        Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "IQBench");
 
     static string StoreDir => Path.Combine(DataDir, "data");
     static string LogFile => Path.Combine(DataDir, "launch.log");
@@ -118,7 +119,7 @@ static class Program
         ApplicationConfiguration.Initialize();
         var form = new Form
         {
-            Text = "API 模型健康检测",
+            Text = "模型智商检测 · IQ Bench",
             ClientSize = new Size(1360, 900),
             MinimumSize = new Size(1080, 720),
             StartPosition = FormStartPosition.CenterScreen,
@@ -140,7 +141,7 @@ static class Program
     {
         try
         {
-            var dev = Environment.GetEnvironmentVariable("APIHEALTH_DEV") == "1";
+            var dev = Environment.GetEnvironmentVariable("IQBENCH_DEV") == "1";
             // DEV 模式额外开 WebView2 远程调试端口，便于 WSL 里用 CDP 驱动原生窗口做端到端验证
             var extraArgs = "--disable-web-security --allow-running-insecure-content"
                 + (dev ? " --remote-debugging-port=9222" : "");

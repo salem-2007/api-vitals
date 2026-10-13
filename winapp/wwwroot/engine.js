@@ -1,159 +1,163 @@
-// engine.js — API 健康检测引擎（纯逻辑层，浏览器 / Node 双端通用）
-// 适配器架构：openai / anthropic / gemini / custom
-// 检测维度：连通、延迟、流式、Token 速率、并发阶梯
+// engine.js — 模型智商检测引擎（纯逻辑层，浏览器 / Node 双端通用，不碰 DOM）
+// 职责：协议适配（openai / anthropic / gemini）、答题、SVG 生成、视觉裁判、判分、统计、报告
 
-export const DEFAULT_PROMPTS = [
-  { label: "文本摘要", user: "请用一句话概括：机器学习是人工智能的一个分支，通过算法让计算机从数据中学习规律，而无需显式编程。", expect: "机器学习" },
-  { label: "数学计算", user: "计算 17 × 23 + 45 的结果，只输出数字。", expect: "436" },
-  { label: "JSON 生成", user: "请输出一个包含 name 和 age 两个字段的 JSON 对象，name 为 Alice，age 为 30。只输出 JSON，不要其他文字。", expect: "Alice" },
-  { label: "翻译任务", user: "将以下句子翻译成英文：今天天气很好，适合出去散步。", expect: "weather" },
-  { label: "逻辑推理", user: "小明比小红高，小红比小刚高，那么三人中谁最矮？只回答名字。", expect: "小刚" },
-  { label: "常识问答", user: "水的化学式是什么？只输出化学式。", expect: "H2O" },
-  { label: "单位换算", user: "把 2.5 千米换算成米，只输出数字。", expect: "2500" },
-  { label: "分类判断", user: "判断这条评论是正面还是负面（只输出：正面 或 负面）：这家店的菜太咸了，服务也很慢。", expect: "负面" },
-];
+import {
+  GROUPS, QUESTIONS, SVG_TASKS, buildSvgPrompt, buildQuestionPrompt, QUESTION_SYSTEM,
+} from "./questions.js";
+
+export { GROUPS, QUESTIONS, SVG_TASKS, buildSvgPrompt, buildQuestionPrompt, QUESTION_SYSTEM };
 
 export const TYPES = [
   { value: "openai", label: "OpenAI 兼容" },
   { value: "anthropic", label: "Anthropic" },
   { value: "gemini", label: "Gemini" },
-  { value: "custom", label: "自定义 HTTP" },
 ];
 
-const now = () => (globalThis.performance && globalThis.performance.now ? globalThis.performance.now() : Date.now());
-const dec = new TextDecoder();
-export const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+// ---------------- 小工具 ----------------
+export const avg = (a) => (a && a.length ? a.reduce((s, v) => s + v, 0) / a.length : null);
 export const rt = (x) => Math.round(x);
-export const avg = (a) => (a && a.length ? Math.round(a.reduce((s, v) => s + v, 0) / a.length) : null);
 export function pct(arr, p) {
   if (!arr || !arr.length) return null;
   const a = [...arr].sort((x, y) => x - y);
   const i = Math.min(a.length - 1, Math.max(0, Math.ceil(p * a.length) - 1));
   return Math.round(a[i]);
 }
+export const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+export const starsFromScore = (score) => Math.max(0, Math.min(5, Math.round((Number(score) || 0) / 20)));
+export const starsText = (n) => "★".repeat(Math.max(0, Math.min(5, n | 0))) + "☆".repeat(5 - Math.max(0, Math.min(5, n | 0)));
 
-const trimBase = (u) => String(u || "").replace(/\/+$/, "");
-
-// 空内容归因：光说「返回空内容」没法排查，这里把最可能的三个原因点出来
-function diagEmpty(j, raw) {
-  const ch = j?.choices?.[0] || {};
-  const msg = ch.message || {};
-  const fr = ch.finish_reason || j?.stop_reason || "";
-  const parts = [];
-  if (msg.reasoning_content || msg.reasoning) parts.push("正文在 reasoning_content（推理模型）");
-  if (msg.tool_calls?.length) parts.push("只有 tool_calls 没有正文");
-  if (String(fr).toLowerCase() === "length") parts.push("被 max_tokens 截断（finish_reason=length）");
-  if (String(fr).toLowerCase() === "content_filter") parts.push("被内容审核拦截");
-  if (!fr) parts.push("上游无 finish_reason");
-  if (j?.error) parts.push("错误体：" + String(j.error?.message || j.error).slice(0, 80));
-  if (!parts.length) parts.push("响应结构非标准：" + String(raw || "").slice(0, 100));
-  return "（" + parts.join("；") + "）";
+// ---------------- 归一化与判分 ----------------
+// 统一全角/半角、各种减号、上下标、去掉空白与常见标点；保留 +-*/^=√πλθ 等数学符号。
+const DASHES = /[\u2010-\u2015\u2212\u2043\ufe63\uff0d]/g;
+const DROP = /[\s\u00a0\u200b\u3000]+|[…·，。、；：！？""''「」『』《》〈〉【】〖〗`"'，]/g;
+export function norm(s) {
+  return String(s ?? "")
+    .normalize("NFKC")
+    .replace(DASHES, "-")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase()
+    .replace(DROP, "");
 }
 
-// 关键词比对归一化：模型回「H₂O」/「Ｈ２Ｏ」/「H 2 O」都应判为命中 H2O。
-// NFKC 负责全角→半角、下标→数字；再去掉空白与常见标点后做包含判断。
-const normCmp = (s) =>
-  String(s ?? "")
-    .normalize("NFKC")
-    .toLowerCase()
-    .replace(/[\s\u00a0\u200b]+/g, "")
-    .replace(/[，。、；：！？""''（）【】《》,.!?;:'"()[\]{}<>_\-—…·]/g, "");
+export function numbers(s) {
+  const out = [];
+  const re = /-?\d+(?:\.\d+)?/g;
+  let m;
+  while ((m = re.exec(norm(s)))) out.push(parseFloat(m[0]));
+  return out;
+}
 
-// 期望命中判定：优先归一化包含；数值类额外做「去千分位/单位」宽松匹配
-export function matchExpect(content, expect) {
-  if (!expect) return true;
-  const c = normCmp(content);
-  const e = normCmp(expect);
-  if (!e) return true;
-  if (c.includes(e)) return true;
-  // 数值宽松：期望是数字时，允许 2,500 / 2500.0 这类写法
-  if (/^\d+(\.\d+)?$/.test(e)) {
-    const nums = c.match(/\d+(\.\d+)?/g) || [];
-    if (nums.some((n) => n === e || Math.abs(Number(n) - Number(e)) < 1e-9)) return true;
+// 按题目 grade 规格判分；候选字符串按顺序尝试，任一命中即算对
+// 组判定：数组 = OR 子串；{any:[...], min:n} = 这些子串总出现次数 >= n
+const hitGroup = (n, group) => {
+  if (Array.isArray(group)) return group.some((x) => n.includes(norm(x)));
+  if (group && Array.isArray(group.any)) {
+    const total = group.any.map(norm).reduce((s, t) => (t ? s + n.split(t).length - 1 : s), 0);
+    return total >= (group.min || 1);
   }
   return false;
+};
+
+export function gradeAnswer(q, candidates) {
+  const g = q.grade || {};
+  const list = (candidates || []).filter((s) => s != null && String(s).trim() !== "");
+  for (const cand of list) {
+    const n = norm(cand);
+    if (!n) continue;
+    if (g.exact && g.exact.some((x) => n === norm(x))) return { ok: true, how: "exact", hit: cand };
+    if (g.digits && n.replace(/\D/g, "").includes(g.digits)) return { ok: true, how: "digits", hit: cand };
+    if (g.num && numbers(n).some((v) => g.num.some((t) => Math.abs(v - t) < 1e-9))) return { ok: true, how: "num", hit: cand };
+    if (g.nums && g.nums.every((t) => numbers(n).some((v) => Math.abs(v - t) < 1e-9))) return { ok: true, how: "nums", hit: cand };
+    if (g.any && g.any.some((x) => n.includes(norm(x)))) return { ok: true, how: "any", hit: cand };
+    if (g.all && g.all.every((group) => hitGroup(n, group))) return { ok: true, how: "all", hit: cand };
+    if (g.alts && g.alts.some((set) => (set.all || []).every((group) => hitGroup(n, group))))
+      return { ok: true, how: "alts", hit: cand };
+  }
+  return { ok: false, how: "", hit: "" };
 }
+
+// 从回答里抽出「答案：X」；找不到就退回最后一行 / 全文
+export function extractAnswerLine(raw) {
+  const text = String(raw ?? "");
+  const lines = text.split(/\r?\n/).map((s) => s.trim()).filter(Boolean);
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const m = lines[i].match(/^(?:最终答案|答案|answer|final(?:\s*answer)?)\s*[:：]\s*(.+)$/i);
+    if (m) return m[1].trim();
+  }
+  return "";
+}
+
+export function answerCandidates(raw) {
+  const text = String(raw ?? "");
+  const lines = text.split(/\r?\n/).map((s) => s.trim()).filter(Boolean);
+  const out = [];
+  const line = extractAnswerLine(text);
+  if (line) out.push(line);
+  const re = /(?:最终答案|答案|answer|final(?:\s*answer)?)\s*[:：]\s*([^\n]+)/gi;
+  let m;
+  while ((m = re.exec(text))) if (m[1] && m[1].trim()) out.push(m[1].trim());
+  if (lines.length) out.push(lines[lines.length - 1]);
+  out.push(text);
+  return [...new Set(out)];
+}
+
+// ---------------- SVG 抽取 / 规整 / 净化 ----------------
+export function extractSvg(text) {
+  const t = String(text ?? "");
+  const fence = t.match(/```(?:svg|xml|html)?\s*([\s\S]*?)```/i);
+  if (fence && /<svg/i.test(fence[1])) return fence[1].trim();
+  const low = t.toLowerCase();
+  const start = low.indexOf("<svg");
+  if (start >= 0) {
+    const end = low.indexOf("</svg>", start);
+    if (end >= 0) return t.slice(start, end + 6).trim();
+  }
+  return "";
+}
+
+// 补全 xmlns / width / height，保证能当图片加载
+export function ensureSvgSize(svg, def = 400) {
+  return String(svg ?? "").replace(/<svg\b[^>]*>/i, (tag) => {
+    let out = tag;
+    let w = null, h = null;
+    const vb = tag.match(/viewBox\s*=\s*["']([^"']+)["']/i);
+    if (vb) {
+      const p = vb[1].trim().split(/[\s,]+/).map(Number);
+      if (p.length === 4 && p.every((x) => isFinite(x))) { w = p[2]; h = p[3]; }
+    }
+    if (!/\bwidth\s*=/i.test(out)) out = out.replace(/<svg/i, `<svg width="${w || def}"`);
+    if (!/\bheight\s*=/i.test(out)) out = out.replace(/<svg/i, `<svg height="${h || def}"`);
+    if (!/\bxmlns\s*=/i.test(out)) out = out.replace(/<svg/i, '<svg xmlns="http://www.w3.org/2000/svg"');
+    return out;
+  });
+}
+
+// 净化：默认连 <script> 一起去掉（用于 <img> 渲染）；keepScript 时保留脚本（仅用于沙箱 iframe）
+export function sanitizeSvg(svg, opts = {}) {
+  let out = String(svg ?? "");
+  if (!opts.keepScript) out = out.replace(/<script[\s\S]*?<\/script>/gi, "").replace(/<script\b[^>]*\/>/gi, "");
+  out = out
+    .replace(/\son[a-z]+\s*=\s*"[^"]*"/gi, "")
+    .replace(/\son[a-z]+\s*=\s*'[^']*'/gi, "")
+    .replace(/(href|src|xlink:href)\s*=\s*["']https?:\/\/[^"']*["']/gi, "");
+  return out;
+}
+
+export const svgDataUrl = (svg) =>
+  "data:image/svg+xml;charset=utf-8," + encodeURIComponent(String(svg ?? ""));
+
+// ---------------- 协议适配 ----------------
+const trimBase = (u) => String(u || "").replace(/\/+$/, "");
+const b64Of = (dataUrl) => String(dataUrl || "").replace(/^data:[^,]*,/, "");
 
 function httpErr(txt, status) {
   try {
     const j = JSON.parse(txt);
-    const m = (j && (j.error?.message || j.message || j.error)) || "";
+    const m = j && (j.error?.message || j.message || j.error);
     if (m) return typeof m === "string" ? m : JSON.stringify(m);
-  } catch {}
-  return "HTTP " + status + (txt ? " · " + String(txt).slice(0, 140) : "");
+  } catch { /* 非 JSON */ }
+  return "HTTP " + status + (txt ? " · " + String(txt).slice(0, 160) : "");
 }
-
-async function fetchWithTimeout(url, init, timeoutMs, outerSignal) {
-  const ctrl = new AbortController();
-  let timedOut = false;
-  const timer = setTimeout(() => { timedOut = true; try { ctrl.abort(); } catch {} }, timeoutMs);
-  const onAbort = () => { try { ctrl.abort(); } catch {} };
-  if (outerSignal) {
-    if (outerSignal.aborted) onAbort();
-    else outerSignal.addEventListener("abort", onAbort, { once: true });
-  }
-  const cleanup = () => {
-    clearTimeout(timer);
-    if (outerSignal) outerSignal.removeEventListener("abort", onAbort);
-  };
-  try {
-    const res = await fetch(url, { ...init, signal: ctrl.signal });
-    return { res, cleanup, timedOut: () => timedOut };
-  } catch (e) {
-    cleanup();
-    if (timedOut) throw new Error("请求超时（" + timeoutMs + "ms）");
-    if (e && e.name === "AbortError") throw new Error("已取消");
-    throw e;
-  }
-}
-
-// 通用 SSE 读取：openai / anthropic / gemini(alt=sse) 都走这里
-async function readSSE(res, hooks) {
-  const { onDelta, extractDelta, doneCheck, usageOf } = hooks || {};
-  const reader = res.body.getReader();
-  const t0 = now();
-  let buf = "", content = "", chunks = 0, done = false, ttft = null, bytes = 0, usage = null;
-  const handleBlock = (block) => {
-    for (const raw of block.split("\n")) {
-      const line = raw.trim();
-      if (!line.startsWith("data:")) continue;
-      const payload = line.slice(5).trim();
-      if (!payload) continue;
-      if (payload === "[DONE]") { done = true; continue; }
-      let j; try { j = JSON.parse(payload); } catch { continue; }
-      const d = extractDelta ? extractDelta(j) : (j?.choices?.[0]?.delta?.content);
-      if (typeof d === "string" && d.length) {
-        if (ttft == null) ttft = now() - t0;
-        chunks++; content += d;
-        if (onDelta) onDelta(d);
-      }
-      const u = usageOf ? usageOf(j) : j?.usage;
-      if (u) usage = { ...(usage || {}), ...u };
-      if (doneCheck && doneCheck(j)) done = true;
-    }
-  };
-  for (;;) {
-    const r = await reader.read();
-    if (r.done) break;
-    bytes += r.value ? r.value.length : 0;
-    buf += dec.decode(r.value, { stream: true });
-    let i;
-    while ((i = buf.indexOf("\n\n")) >= 0) {
-      handleBlock(buf.slice(0, i));
-      buf = buf.slice(i + 2);
-    }
-  }
-  if (buf.trim()) handleBlock(buf);
-  return { content, chunks, done, ttftMs: ttft == null ? null : rt(ttft), usage, bytes };
-}
-
-// ---------------- 适配器 ----------------
-
-const gb = (p) => {
-  let b = trimBase(p.baseUrl || ADAPTERS.gemini.defaultBase());
-  if (!/\/v\d+(beta)?$/.test(b)) b += "/v1beta";
-  return b;
-};
 
 export const ADAPTERS = {
   openai: {
@@ -168,26 +172,29 @@ export const ADAPTERS = {
     modelsUrl: (p) => trimBase(p.baseUrl) + "/models",
     parseModels: (j) => (j?.data || []).map((x) => (typeof x === "string" ? x : x?.id)).filter(Boolean).map(String),
     chatUrl: (p) => trimBase(p.baseUrl) + "/chat/completions",
-    buildChat(p, model, prompt, stream, maxTokens) {
-      const b = {
-        model,
-        messages: [
-          { role: "system", content: "你是一个有用的助手。请准确回答用户的问题。" },
-          { role: "user", content: prompt?.user ?? "" },
-        ],
-        max_tokens: maxTokens || 200,
-        temperature: 0,
-      };
-      if (stream) { b.stream = true; b.stream_options = { include_usage: true }; }
-      return b;
+    buildMessages(model, { system, user, parts, maxTokens, temperature }) {
+      const messages = [];
+      if (system) messages.push({ role: "system", content: system });
+      if (parts) {
+        messages.push({
+          role: "user",
+          content: parts.map((pt) => pt.type === "image"
+            ? { type: "image_url", image_url: { url: pt.dataUrl } }
+            : { type: "text", text: pt.text }),
+        });
+      } else {
+        messages.push({ role: "user", content: user ?? "" });
+      }
+      return { model, messages, max_tokens: maxTokens, temperature };
     },
     parseChat(j) {
+      const ch = j?.choices?.[0] || {};
       return {
-        content: String(j?.choices?.[0]?.message?.content ?? "").trim(),
+        content: String(ch.message?.content ?? "").trim(),
         tokens: j?.usage?.completion_tokens ?? null,
+        finish: String(ch.finish_reason ?? ""),
       };
     },
-    sseHooks: null, // 默认 openai 格式
   },
 
   anthropic: {
@@ -202,23 +209,24 @@ export const ADAPTERS = {
     modelsUrl: (p) => trimBase(p.baseUrl || ADAPTERS.anthropic.defaultBase()) + "/v1/models",
     parseModels: (j) => (j?.data || []).map((x) => (typeof x === "string" ? x : x?.id)).filter(Boolean).map(String),
     chatUrl: (p) => trimBase(p.baseUrl || ADAPTERS.anthropic.defaultBase()) + "/v1/messages",
-    buildChat(p, model, prompt, stream) {
-      const b = { model, max_tokens: 200, messages: [{ role: "user", content: prompt?.user ?? "" }] };
-      if (stream) b.stream = true;
+    buildMessages(model, { system, user, parts, maxTokens, temperature }) {
+      const b = { model, max_tokens: maxTokens, temperature };
+      if (system) b.system = system;
+      if (parts) {
+        b.messages = [{
+          role: "user",
+          content: parts.map((pt) => pt.type === "image"
+            ? { type: "image", source: { type: "base64", media_type: "image/png", data: b64Of(pt.dataUrl) } }
+            : { type: "text", text: pt.text }),
+        }];
+      } else {
+        b.messages = [{ role: "user", content: user ?? "" }];
+      }
       return b;
     },
     parseChat(j) {
       const t = (j?.content || []).map((c) => c?.text || "").join("").trim();
-      return { content: t, tokens: j?.usage?.output_tokens ?? null };
-    },
-    sseHooks: {
-      extractDelta: (j) => (j?.type === "content_block_delta" ? (j?.delta?.text || "") : ""),
-      doneCheck: (j) => j?.type === "message_stop",
-      usageOf: (j) => {
-        if (j?.type === "message_delta" && j?.usage) return { completion_tokens: j.usage.output_tokens ?? null };
-        if (j?.type === "message_start" && j?.message?.usage) return { completion_tokens: j.message.usage.output_tokens ?? null };
-        return null;
-      },
+      return { content: t, tokens: j?.usage?.output_tokens ?? null, finish: String(j?.stop_reason ?? "") };
     },
   },
 
@@ -232,264 +240,469 @@ export const ADAPTERS = {
     },
     modelsUrl: (p) => gb(p) + "/models",
     parseModels: (j) => (j?.models || []).map((m) => String(m?.name || "").replace(/^models\//, "")).filter(Boolean),
-    chatUrl: (p, model, stream) =>
-      gb(p) + "/models/" + encodeURIComponent(model) + (stream ? ":streamGenerateContent?alt=sse" : ":generateContent"),
-    buildChat(p, model, prompt) {
-      return {
-        contents: [{ role: "user", parts: [{ text: prompt?.user ?? "" }] }],
-        generationConfig: { maxOutputTokens: 200, temperature: 0 },
-      };
+    chatUrl: (p, model) => gb(p) + "/models/" + encodeURIComponent(model) + ":generateContent",
+    buildMessages(model, { system, user, parts, maxTokens, temperature }) {
+      const b = { generationConfig: { maxOutputTokens: maxTokens, temperature } };
+      if (system) b.systemInstruction = { parts: [{ text: system }] };
+      if (parts) {
+        b.contents = [{
+          role: "user",
+          parts: parts.map((pt) => pt.type === "image"
+            ? { inlineData: { mimeType: "image/png", data: b64Of(pt.dataUrl) } }
+            : { text: pt.text }),
+        }];
+      } else {
+        b.contents = [{ role: "user", parts: [{ text: user ?? "" }] }];
+      }
+      return b;
     },
     parseChat(j) {
       const t = (j?.candidates?.[0]?.content?.parts || []).map((x) => x?.text || "").join("").trim();
-      return { content: t, tokens: j?.usageMetadata?.candidatesTokenCount ?? null };
-    },
-    sseHooks: {
-      extractDelta: (j) => ((j?.candidates?.[0]?.content?.parts || []).map((x) => x?.text || "").join("")),
-      doneCheck: (j) => {
-        const fr = j?.candidates?.[0]?.finishReason;
-        return !!fr && fr !== "FINISH_REASON_UNSPECIFIED";
-      },
-      usageOf: (j) => (j?.usageMetadata ? { completion_tokens: j.usageMetadata.candidatesTokenCount ?? null } : null),
-    },
-  },
-
-  custom: {
-    label: "自定义 HTTP",
-    defaultBase: () => "https://example.com/health",
-    headers() { return {}; },
-    async ping(p, opts = {}) {
-      const { timeoutMs = 15000, signal } = opts;
-      const method = String(p.method || "GET").toUpperCase();
-      const h = {};
-      if (p.apiKey) h[p.keyHeader || "Authorization"] = (p.keyPrefix != null ? p.keyPrefix : "Bearer ") + p.apiKey;
-      if (p.headers && typeof p.headers === "object") Object.assign(h, p.headers);
-      const init = { method, headers: h };
-      if (method !== "GET" && method !== "HEAD" && p.body) {
-        init.body = typeof p.body === "string" ? p.body : JSON.stringify(p.body);
-        if (!h["Content-Type"]) h["Content-Type"] = "application/json";
-      }
-      const t0 = now();
-      const { res, cleanup } = await fetchWithTimeout(p.baseUrl, init, timeoutMs, signal);
-      try {
-        const txt = await res.text().catch(() => "");
-        const latencyMs = rt(now() - t0);
-        const ok = res.status >= 200 && res.status < 400;
-        return { ok, status: res.status, latencyMs, preview: String(txt).slice(0, 200), error: ok ? "" : httpErr(txt, res.status) };
-      } finally { cleanup(); }
+      const fr = j?.candidates?.[0]?.finishReason;
+      return { content: t, tokens: j?.usageMetadata?.candidatesTokenCount ?? null, finish: fr ? String(fr).toLowerCase() : "" };
     },
   },
 };
 
+function gb(p) {
+  let b = trimBase(p.baseUrl || ADAPTERS.gemini.defaultBase());
+  if (!/\/v\d+(beta)?$/.test(b)) b += "/v1beta";
+  return b;
+}
+
 export const adapterOf = (p) => ADAPTERS[p?.type] || ADAPTERS.openai;
 
-// ---------------- 检测操作 ----------------
+async function fetchJson(url, init, timeoutMs, outerSignal) {
+  const ctrl = new AbortController();
+  let timedOut = false;
+  const timer = setTimeout(() => { timedOut = true; try { ctrl.abort(); } catch { /* noop */ } }, timeoutMs);
+  const onAbort = () => { try { ctrl.abort(); } catch { /* noop */ } };
+  if (outerSignal) {
+    if (outerSignal.aborted) onAbort();
+    else outerSignal.addEventListener("abort", onAbort, { once: true });
+  }
+  const cleanup = () => {
+    clearTimeout(timer);
+    if (outerSignal) outerSignal.removeEventListener("abort", onAbort);
+  };
+  try {
+    const res = await fetch(url, { ...init, signal: ctrl.signal });
+    const txt = await res.text();
+    return { res, txt };
+  } catch (e) {
+    if (timedOut) throw new Error("请求超时（" + timeoutMs + "ms）");
+    if (e && e.name === "AbortError") throw new Error("已取消");
+    throw e;
+  } finally {
+    cleanup();
+  }
+}
 
 export async function listModels(p, opts = {}) {
   const a = adapterOf(p);
   const { timeoutMs = 15000, signal } = opts;
-  if (!a.modelsUrl) throw new Error("该类型不支持模型列表");
-  const { res, cleanup } = await fetchWithTimeout(a.modelsUrl(p), { method: "GET", headers: a.headers(p, false) }, timeoutMs, signal);
-  try {
-    const txt = await res.text();
-    if (!res.ok) { const e = new Error(httpErr(txt, res.status)); e.status = res.status; throw e; }
-    let j; try { j = JSON.parse(txt); } catch { throw new Error("模型列表响应非 JSON"); }
-    return [...new Set(a.parseModels(j))].sort();
-  } finally { cleanup(); }
+  const { res, txt } = await fetchJson(a.modelsUrl(p), { method: "GET", headers: a.headers(p, false) }, timeoutMs, signal);
+  if (!res.ok) { const e = new Error(httpErr(txt, res.status)); e.status = res.status; throw e; }
+  let j; try { j = JSON.parse(txt); } catch { throw new Error("模型列表响应非 JSON"); }
+  return [...new Set(a.parseModels(j))].sort();
 }
 
-// 连通测试
 export async function opConnectivity(p, opts = {}) {
-  const a = adapterOf(p);
-  const t0 = now();
-  if (p.type === "custom") {
-    try {
-      const r = await a.ping(p, opts);
-      return { provider: p.name, kind: "connect", models: [], t: Date.now(), ...r };
-    } catch (e) {
-      return { provider: p.name, kind: "connect", ok: false, status: 0, latencyMs: rt(now() - t0), models: [], error: String(e?.message || e), preview: "", t: Date.now() };
-    }
-  }
+  const t0 = Date.now();
   try {
     const models = await listModels(p, opts);
-    return { provider: p.name, kind: "connect", ok: true, status: 200, latencyMs: rt(now() - t0), models, error: "", preview: models.slice(0, 3).join(", "), t: Date.now() };
+    return { provider: p.name, kind: "connect", ok: true, status: 200, latencyMs: Date.now() - t0, models, error: "", t: Date.now() };
   } catch (e) {
-    return { provider: p.name, kind: "connect", ok: false, status: e.status || 0, latencyMs: rt(now() - t0), models: [], error: String(e?.message || e), preview: "", t: Date.now() };
+    return { provider: p.name, kind: "connect", ok: false, status: e.status || 0, latencyMs: Date.now() - t0, models: [], error: String(e?.message || e), t: Date.now() };
   }
 }
 
-// 对话测试（流式 / 非流式通用）
-export async function opChat(p, model, prompt, opts = {}) {
+// 单次对话请求（不含重试）
+async function callChat(p, model, payloadOpts, opts = {}) {
   const a = adapterOf(p);
-  const { stream = false, timeoutMs = 60000, signal, onDelta, kind, maxTokens } = opts;
-  const t0 = now();
-  const row = {
-    provider: p?.name || "", type: p?.type || "", model, label: prompt?.label ?? "",
-    kind: kind || (stream ? "stream" : "chat"), stream,
-    ok: false, status: 0, error: "", latencyMs: 0, ttftMs: null,
-    tokens: null, chars: 0, tps: null, unit: null, preview: "", streamInfo: null, t: Date.now(),
-  };
-  try {
-    const url = a.chatUrl(p, model, stream);
-    if (!url) throw new Error("该类型不支持对话测试");
-    const body = a.buildChat(p, model, prompt, stream, maxTokens);
-    const init = { method: "POST", headers: a.headers(p, true), body: JSON.stringify(body) };
-    const { res, cleanup } = await fetchWithTimeout(url, init, timeoutMs, signal);
+  const { timeoutMs = 120000, signal } = opts;
+  const url = a.chatUrl(p, model);
+  const body = a.buildMessages(model, payloadOpts);
+  const t0 = Date.now();
+  const { res, txt } = await fetchJson(url, { method: "POST", headers: a.headers(p, true), body: JSON.stringify(body) }, timeoutMs, signal);
+  const latencyMs = Date.now() - t0;
+  if (!res.ok) { const e = new Error(httpErr(txt, res.status)); e.status = res.status; e.retryAfter = res.headers.get("Retry-After"); throw e; }
+  let j; try { j = JSON.parse(txt); } catch { throw new Error("响应非 JSON: " + String(txt).slice(0, 120)); }
+  const parsed = a.parseChat(j);
+  return { ...parsed, latencyMs, status: res.status };
+}
+
+// 带重试：429 指数退避持续重试；5xx/网络抖动按 retries 重试；length 截断自动抬高 maxTokens
+export async function callChatRetry(p, model, payloadOpts, cfg = {}, opts = {}) {
+  const retries = Math.max(0, cfg.retries ?? 2);
+  const rlMax = Math.max(0, cfg.rlRetries ?? 6);
+  const rlBase = Math.max(1, cfg.rlBaseSec ?? 5);
+  const rlCap = Math.max(rlBase, cfg.rlCapSec ?? 120);
+  const ceiling = Math.max(payloadOpts.maxTokens || 2048, cfg.maxTokensCeiling ?? 8192);
+  const onNote = opts.onNote || (() => {});
+  let maxTokens = payloadOpts.maxTokens || 2048;
+  let rl = 0, normal = 0;
+  for (;;) {
+    if (opts.signal?.aborted) return { ok: false, content: "", tokens: null, latencyMs: 0, error: "已取消", rlRetries: rl };
     try {
-      row.status = res.status;
-      if (!res.ok) {
-        const txt = await res.text().catch(() => "");
-        const e = new Error(httpErr(txt, res.status)); e.status = res.status; throw e;
+      const r = await callChat(p, model, { ...payloadOpts, maxTokens }, opts);
+      if (String(r.finish).toLowerCase() === "length" && maxTokens < ceiling) {
+        const prev = maxTokens;
+        maxTokens = Math.min(maxTokens * 2, ceiling);
+        onNote(`输出在 ${prev} token 处截断，提高到 ${maxTokens} 后重试`);
+        continue;
       }
-      if (stream) {
-        const hooks = a.sseHooks || {};
-        const s = await readSSE(res, { onDelta, extractDelta: hooks.extractDelta, doneCheck: hooks.doneCheck, usageOf: hooks.usageOf });
-        row.latencyMs = rt(now() - t0);
-        row.ttftMs = s.ttftMs;
-        row.tokens = (s.usage && s.usage.completion_tokens != null) ? s.usage.completion_tokens : s.chunks;
-        row.chars = s.content.length;
-        row.streamInfo = { chunks: s.chunks, done: !!s.done, usage: !!s.usage, bytes: s.bytes };
-        row.preview = s.content.slice(0, 80);
-        if (!s.content) {
-          row.error = "流式返回空内容";
-        } else {
-          if (!matchExpect(s.content, prompt?.expect)) {
-            row.error = "缺少关键词「" + prompt.expect + "」";
-          } else {
-            row.ok = true;
-            if (!s.done) row.error = "未见结束标记（内容正常）";
-          }
-        }
-      } else {
-        const txt = await res.text();
-        row.latencyMs = rt(now() - t0);
-        row.ttftMs = row.latencyMs;
-        let j; try { j = JSON.parse(txt); } catch { throw new Error("响应非 JSON: " + String(txt).slice(0, 120)); }
-        const pr = a.parseChat(j);
-        row.tokens = pr.tokens;
-        row.chars = pr.content.length;
-        row.preview = pr.content.slice(0, 80);
-        if (!pr.content) {
-          // 空内容但 HTTP 200：多半是 reasoning 模型把正文放进了 reasoning_content，
-          // 或 finish_reason=length 被 max_tokens 截断，或上游返回了非标准结构。
-          const raw = JSON.stringify(j);
-          const d = diagEmpty(j, raw);
-          row.error = "模型返回空内容" + d;
-          row.preview = raw.slice(0, 200);
-          // 截断 / 空正文这类多为偶发或额度不足，值得加大 max_tokens 重试一次
-          row.retryable = /截断|无 finish_reason|非标准/.test(d);
-        } else {
-          if (!matchExpect(pr.content, prompt?.expect)) row.error = "缺少关键词「" + prompt.expect + "」";
-          row.ok = !row.error;
-        }
-        row.content = pr.content.slice(0, 4000);
+      return { ok: true, ...r, maxTokensUsed: maxTokens, rlRetries: rl };
+    } catch (e) {
+      const st = e?.status || 0;
+      if (st === 429 && rl < rlMax) {
+        rl++;
+        const ra = parseFloat(e.retryAfter);
+        const wait = isFinite(ra) && ra > 0 ? Math.min(ra, rlCap) : Math.min(rlBase * 2 ** Math.min(rl - 1, 6), rlCap);
+        onNote(`遇到 429 限流，等待 ${Math.round(wait)}s 后重试（第 ${rl} 次）`);
+        await sleep(wait * 1000);
+        continue;
       }
-      const secs = row.latencyMs / 1000;
-      if (secs > 0) {
-        if (row.tokens) { row.tps = Math.round((row.tokens / secs) * 10) / 10; row.unit = "tok/s"; }
-        else if (row.chars) { row.tps = Math.round((row.chars / secs) * 10) / 10; row.unit = "char/s"; }
+      const retryable = st === 0 || st === 429 || st >= 500;
+      if (retryable && normal < retries) {
+        normal++;
+        await sleep(Math.min(2 ** normal, 8) * 1000);
+        continue;
       }
-    } finally { cleanup(); }
-  } catch (e) {
-    row.latencyMs = rt(now() - t0);
-    row.error = String(e?.message || e);
-    row.status = row.status || (e?.status || 0);
-    row.ok = false;
-    // 5xx / 429 / 网络抖动可重试；4xx 参数或鉴权错误重试无意义
-    const st = row.status || 0;
-    row.retryable = st === 0 || st === 429 || st >= 500;
-  }
-  return row;
-}
-
-// 带重试的对话测试：只重试「可重试」类失败（5xx/429/网络抖动/被截断），
-// 关键词不符这类是模型的真实回答问题，重试无意义。
-export async function opChatRetry(p, model, prompt, opts = {}) {
-  const { retries = 1, ...rest } = opts;
-  let row = await opChat(p, model, prompt, rest);
-  let attempt = 0;
-  while (!row.ok && row.retryable && attempt < retries && !rest.signal?.aborted) {
-    attempt++;
-    await sleep(400 * attempt);            // 退避一下再打
-    const bigger = /截断/.test(row.error || "") ? { maxTokens: 800 } : {};
-    const again = await opChat(p, model, prompt, { ...rest, ...bigger });
-    again.retried = attempt;
-    // 重试成功就采用新结果；仍失败但新结果更"真实"（有关键词）也采用
-    if (again.ok || !again.retryable) { row = again; break; }
-    row = again;
-  }
-  return row;
-}
-
-// 延迟测试：非流式采样 n 次（单次失败自动重试，避免网络抖动污染 p50/p95）
-export async function opLatency(p, model, prompt, opts = {}) {
-  const { n = 3, timeoutMs = 60000, signal, onRow, retries = 1 } = opts;
-  const rows = [];
-  for (let i = 0; i < n; i++) {
-    if (signal?.aborted) break;
-    const r = await opChatRetry(p, model, prompt, { timeoutMs, signal, retries });
-    rows.push(r);
-    if (onRow) onRow(r);
-  }
-  const okRows = rows.filter((r) => r.ok);
-  const lat = okRows.map((r) => r.latencyMs);
-  return {
-    provider: p.name, kind: "latency", model,
-    samples: rows.length, ok: okRows.length,
-    avgMs: avg(lat), p50: pct(lat, 0.5), p95: pct(lat, 0.95),
-    rows, t: Date.now(),
-  };
-}
-
-// 并发测试：固定并发数，一次性并行发起 N 个请求，观察成功率 / 延迟 / 吞吐
-// 要点：并发生效只取决于「同时在飞的请求数」，靠 worker 数量控制，
-// 与 prompts 长度无关（早期版本会把 prompts 轮完才停，导致并发数被用例数限制）。
-export async function opConcurrent(p, model, prompts, opts = {}) {
-  const { n = 4, timeoutMs = 60000, signal, onProgress } = opts;
-  const total = Math.max(1, Math.min(64, n));
-  const list = (prompts && prompts.length) ? prompts : [{ label: "并发", user: "计算 1+1 的结果，只输出数字。", expect: "2" }];
-  const lat = [];
-  const errs = [];
-  let ok = 0, fail = 0, finished = 0;
-  const t0 = now();
-
-  // 每批同时放 total 个请求，批内并发度 = total
-  const jobs = Array.from({ length: total }, (_, k) => k);
-  const worker = async () => {
-    for (;;) {
-      if (signal?.aborted) return;
-      const k = jobs.shift();
-      if (k === undefined) return;
-      const r = await opChatRetry(p, model, list[k % list.length], { timeoutMs, signal, retries: 1 });
-      if (r.ok) { ok++; lat.push(r.latencyMs); } else { fail++; errs.push(r.error || "失败"); }
-      finished++;
-      if (onProgress) onProgress({ finished, total });
+      return { ok: false, content: "", tokens: null, latencyMs: 0, status: st, error: String(e?.message || e), rlRetries: rl };
     }
+  }
+}
+
+// ---------------- 学科题：作答 + 自动判分 ----------------
+export async function opAskQuestion(p, model, q, cfg = {}, opts = {}) {
+  const t0 = Date.now();
+  const row = {
+    qid: q.id, no: q.no, group: q.group, type: q.type, level: q.level,
+    provider: p.name, model, expected: q.answer,
+    ok: false, got: "", raw: "", gradeHow: "", latencyMs: 0, tokens: null, error: "", t: Date.now(),
   };
-  await Promise.all(Array.from({ length: total }, () => worker()));
-  const wallMs = rt(now() - t0);
-  const done = ok + fail;
+  const res = await callChatRetry(p, model, {
+    system: QUESTION_SYSTEM,
+    user: buildQuestionPrompt(q),
+    maxTokens: cfg.maxTokens ?? 2048,
+    temperature: cfg.temperature ?? 0,
+  }, cfg, { ...opts, onNote: opts.onNote });
+  row.latencyMs = Date.now() - t0;
+  if (!res.ok) { row.error = res.error || "请求失败"; row.rlRetries = res.rlRetries || 0; return row; }
+  row.tokens = res.tokens;
+  row.raw = res.content;
+  row.rlRetries = res.rlRetries || 0;
+  let grade = gradeAnswer(q, answerCandidates(res.content));
+  // 有推理但没给出可判定的最终答案 → 追加一次短请求只让它补答案
+  if (!grade.ok && String(res.content).trim() && opts.followup !== false) {
+    const fu = await callChatRetry(p, model, {
+      system: QUESTION_SYSTEM,
+      user: `你刚才的分析如下：\n\n${String(res.content).slice(0, 4000)}\n\n请只输出最终答案，格式必须为：答案：<答案>`,
+      maxTokens: 64,
+      temperature: 0,
+    }, { ...cfg, retries: 1 }, { ...opts, onNote: opts.onNote });
+    if (fu.ok && fu.content) {
+      row.raw = res.content + "\n\n[补答]\n" + fu.content;
+      row.tokens = (res.tokens || 0) + (fu.tokens || 0);
+      row.latencyMs = Date.now() - t0;
+      row.followup = true;
+      grade = gradeAnswer(q, answerCandidates(fu.content).concat(answerCandidates(res.content)));
+    }
+  }
+  row.ok = grade.ok;
+  row.got = grade.hit || extractAnswerLine(res.content) || "";
+  row.gradeHow = grade.how;
+  if (!row.ok && !row.error) row.error = res.content ? "答案不符" : "空响应";
+  return row;
+}
+
+// ---------------- SVG 生成 ----------------
+export async function opGenSvg(p, model, task, cfg = {}, opts = {}) {
+  const t0 = Date.now();
+  const row = {
+    taskId: task.id, title: task.title, provider: p.name, model,
+    ok: false, svg: "", raw: "", latencyMs: 0, tokens: null, error: "", t: Date.now(),
+  };
+  const res = await callChatRetry(p, model, {
+    system: "你是资深 SVG 动画工程师，只输出可直接运行的 SVG 代码。",
+    user: buildSvgPrompt(task),
+    maxTokens: cfg.svgMaxTokens ?? 8192,
+    temperature: cfg.svgTemperature ?? 0.4,
+  }, { ...cfg, retries: Math.min(1, cfg.retries ?? 1) }, { ...opts, onNote: opts.onNote });
+  row.latencyMs = Date.now() - t0;
+  if (!res.ok) { row.error = res.error || "请求失败"; return row; }
+  row.tokens = res.tokens;
+  row.raw = res.content;
+  const svg = extractSvg(res.content);
+  if (!svg) { row.error = "未从回复中解析出 <svg>"; return row; }
+  row.svg = ensureSvgSize(svg);
+  row.ok = true;
+  return row;
+}
+
+// ---------------- 视觉裁判 ----------------
+export function buildJudgeParts(task, { candidateFrames = [], svg = "", motion = null }) {
+  const parts = [];
+  parts.push({
+    type: "text",
+    text: [
+      `你是严格的 SVG 动画评审专家（视觉裁判）。`,
+      `作品主题：${task.title}（${task.brief}）`,
+      "",
+      "评分维度：",
+      ...task.criteria.map((c, i) => `${i + 1}. ${c}`),
+      "",
+      "下面是候选作品的动画截图与源码。",
+      "请逐项判断是否达标，并给出总分（0-100）与星级（0-5）。",
+      motion == null ? "" : `（帧间差异检测：${motion ? "有" : "无"}动画，请结合判断）`,
+    ].filter(Boolean).join("\n"),
+  });
+  parts.push({ type: "text", text: "【动画帧】" });
+  candidateFrames.forEach((f, i) => parts.push({ type: "image", dataUrl: f, label: `候选帧${i + 1}` }));
+  parts.push({ type: "text", text: "【源码】\n```svg\n" + String(svg || "").slice(0, 6000) + "\n```" });
+  parts.push({
+    type: "text",
+    text: [
+      "请只输出一个 JSON 对象，不要任何额外文字，格式如下：",
+      "{",
+      '  "score": 0-100 的整数,',
+      '  "stars": 0-5 的整数,',
+      '  "verdict": "一句话总评",',
+      '  "criteria": [{"name":"评分维度名","pass":true,"comment":"简短理由"}],',
+      '  "problems": ["主要问题"],',
+      '  "suggestions": ["改进建议"]',
+      "}",
+    ].join("\n"),
+  });
+  return parts;
+}
+
+export function parseJudgeJson(text) {
+  const t = String(text ?? "");
+  const fence = t.match(/```(?:json)?\s*([\s\S]*?)```/i);
+  const tries = [];
+  if (fence) tries.push(fence[1]);
+  const s = t.indexOf("{");
+  if (s >= 0) {
+    let depth = 0, end = -1;
+    for (let i = s; i < t.length; i++) {
+      if (t[i] === "{") depth++;
+      else if (t[i] === "}") { depth--; if (depth === 0) { end = i; break; } }
+    }
+    if (end > s) tries.push(t.slice(s, end + 1));
+  }
+  tries.push(t);
+  for (const cand of tries) {
+    try {
+      const j = JSON.parse(cand);
+      if (j && typeof j === "object") {
+        const score = Math.max(0, Math.min(100, Math.round(Number(j.score) || 0)));
+        return {
+          score,
+          stars: Number.isFinite(Number(j.stars)) ? Math.max(0, Math.min(5, Math.round(Number(j.stars)))) : starsFromScore(score),
+          verdict: String(j.verdict || ""),
+          criteria: Array.isArray(j.criteria) ? j.criteria.map((c) => ({
+            name: String(c?.name || ""), pass: !!c?.pass, comment: String(c?.comment || ""),
+          })) : [],
+          problems: Array.isArray(j.problems) ? j.problems.map(String) : [],
+          suggestions: Array.isArray(j.suggestions) ? j.suggestions.map(String) : [],
+        };
+      }
+    } catch { /* 换下一种解析 */ }
+  }
+  return null;
+}
+
+export async function opJudgeSvg(judgeProvider, judgeModel, task, payload, cfg = {}, opts = {}) {
+  const t0 = Date.now();
+  const parts = buildJudgeParts(task, payload);
+  const res = await callChatRetry(judgeProvider, judgeModel, {
+    system: "你是严格的 SVG 动画评审专家，只输出 JSON。",
+    parts,
+    maxTokens: cfg.judgeMaxTokens ?? 2048,
+    temperature: 0,
+  }, { retries: 1, rlRetries: cfg.rlRetries ?? 6 }, opts);
+  const out = { ok: false, latencyMs: Date.now() - t0, tokens: null, error: "", raw: "", judge: null };
+  if (!res.ok) { out.error = res.error || "裁判请求失败"; return out; }
+  out.tokens = res.tokens;
+  out.raw = res.content;
+  out.judge = parseJudgeJson(res.content);
+  if (!out.judge) { out.error = "裁判输出无法解析为 JSON"; return out; }
+  out.ok = true;
+  return out;
+}
+
+// ---------------- AI 复核：判两份答案是否等价 ----------------
+export async function opJudgeAnswer(judgeProvider, judgeModel, q, answer, cfg = {}, opts = {}) {
+  const t0 = Date.now();
+  const res = await callChatRetry(judgeProvider, judgeModel, {
+    system: "你是严格的阅卷老师，只输出 JSON，不做多余解释。",
+    user: [
+      `题目：${q.prompt}`,
+      "",
+      `标准答案：${q.answer}`,
+      `考生答案：${String(answer || "").slice(0, 3000) || "（空）"}`,
+      "",
+      "请判断考生答案与标准答案是否在数学/逻辑上等价（允许不同写法、不同顺序、等价变形）。",
+      '只输出 JSON：{"correct":true 或 false,"reason":"一句话理由"}',
+    ].join("\n"),
+    maxTokens: 256,
+    temperature: 0,
+  }, { retries: 1, rlRetries: cfg.rlRetries ?? 6 }, opts);
+  const out = { ok: false, correct: null, reason: "", raw: "", latencyMs: Date.now() - t0, error: "" };
+  if (!res.ok) { out.error = res.error || "复核请求失败"; return out; }
+  out.raw = res.content;
+  const t = String(res.content);
+  const m = t.match(/\{[\s\S]*\}/);
+  if (m) {
+    try {
+      const j = JSON.parse(m[0]);
+      out.correct = !!j.correct;
+      out.reason = String(j.reason || "");
+      out.ok = true;
+      return out;
+    } catch { /* 落到兜底 */ }
+  }
+  out.error = "复核输出无法解析";
+  return out;
+}
+
+// ---------------- 并发池 ----------------
+export async function runPool(items, limit, worker, shouldStop = () => false) {
+  const out = new Array(items.length);
+  let cursor = 0;
+  const n = Math.max(1, Math.min(items.length || 1, limit | 0 || 1));
+  const runners = Array.from({ length: n }, async () => {
+    for (;;) {
+      if (shouldStop()) return;
+      const i = cursor++;
+      if (i >= items.length) return;
+      out[i] = await worker(items[i], i);
+    }
+  });
+  await Promise.all(runners);
+  return out;
+}
+
+// ---------------- 统计 ----------------
+export function modelStats(m) {
+  const q = m.q || [];
+  const svg = m.svg || [];
+  const correct = q.filter((r) => r.ok).length;
+  const judged = svg.filter((r) => r.judge);
+  const scores = judged.map((r) => r.judge.score);
+  const stars = judged.map((r) => r.judge.stars);
   return {
-    provider: p.name, model, concurrency: total,
-    ok, fail,
-    avgMs: avg(lat), p50: pct(lat, 0.5), p95: pct(lat, 0.95),
-    wallMs,
-    throughput: wallMs > 0 ? Math.round((done / (wallMs / 1000)) * 10) / 10 : null, // 请求/秒
-    errors: [...new Set(errs)].slice(0, 3),
+    qTotal: q.length, qCorrect: correct, qWrong: q.length - correct,
+    qRate: q.length ? Math.round((correct / q.length) * 100) : null,
+    svgTotal: svg.length, svgDrawn: svg.filter((r) => r.svg).length,
+    svgJudged: judged.length,
+    svgAvgScore: scores.length ? Math.round(avg(scores)) : null,
+    svgAvgStars: stars.length ? Math.round(avg(stars) * 10) / 10 : null,
+    avgLatencyMs: q.length ? Math.round(avg(q.map((r) => r.latencyMs || 0))) : null,
+    tokens: q.reduce((s, r) => s + (r.tokens || 0), 0) + svg.reduce((s, r) => s + (r.tokens || 0), 0),
   };
 }
 
-// 并发结论：全部成功 = 该并发档位可用
-export function concurrencyVerdict(res) {
-  if (!res) return null;
-  const total = res.ok + res.fail;
-  if (!total) return null;
-  const rate = res.ok / total;
+export function groupStats(qRows) {
+  return GROUPS.map((g) => {
+    const rows = qRows.filter((r) => r.group === g.key);
+    const ok = rows.filter((r) => r.ok).length;
+    return { key: g.key, label: g.label, total: rows.length, ok, rate: rows.length ? Math.round((ok / rows.length) * 100) : null };
+  }).filter((g) => g.total > 0);
+}
+
+export function runStats(run) {
+  const models = run?.models || [];
+  const q = models.flatMap((m) => m.q || []);
+  const svg = models.flatMap((m) => m.svg || []);
+  const correct = q.filter((r) => r.ok).length;
+  const judged = svg.filter((r) => r.judge);
   return {
-    supported: res.fail === 0,
-    rate,
-    level: res.concurrency,
-    p95: res.p95,
-    throughput: res.throughput,
+    models: models.length,
+    qTotal: q.length, qCorrect: correct,
+    qRate: q.length ? Math.round((correct / q.length) * 100) : null,
+    svgTotal: svg.length,
+    svgAvgStars: judged.length ? Math.round(avg(judged.map((r) => r.judge.stars)) * 10) / 10 : null,
+    best: models.slice().sort((a, b) => (modelStats(b).qRate ?? -1) - (modelStats(a).qRate ?? -1))[0] || null,
   };
+}
+
+// ---------------- 报告 ----------------
+const csvCell = (v) => `"${String(v ?? "").replace(/"/g, '""')}"`;
+const csvRow = (arr) => arr.map(csvCell).join(",");
+
+export function flattenRun(run) {
+  const rows = [];
+  for (const m of run?.models || []) {
+    for (const r of m.q || []) {
+      rows.push({
+        kind: "question", provider: m.provider, model: m.model, t: r.t,
+        id: r.qid, type: r.type, group: r.group, ok: r.ok, expected: r.expected,
+        got: r.got, latencyMs: r.latencyMs, tokens: r.tokens, error: r.error,
+        detail: String(r.raw || "").replace(/\s+/g, " ").slice(0, 500),
+      });
+    }
+    for (const r of m.svg || []) {
+      rows.push({
+        kind: "svg", provider: m.provider, model: m.model, t: r.t,
+        id: r.taskId, type: r.title, group: "SVG动画", ok: !!(r.judge && r.judge.score >= 60),
+        expected: "按评分维度评审", got: r.judge ? `${r.judge.score}分 / ${r.judge.stars}★` : "",
+        latencyMs: r.latencyMs, tokens: r.tokens, error: r.error,
+        detail: r.judge ? r.judge.verdict : "",
+      });
+    }
+  }
+  return rows;
+}
+
+export function buildReportCsv(run) {
+  const when = new Date(run?.ts || Date.now()).toLocaleString("zh-CN", { hour12: false });
+  const lines = [
+    csvRow(["模型智商检测报告", "", "", "", "", "", "", ""]),
+    csvRow(["时间", when]),
+    csvRow(["端点", run?.providerCount ?? "", "模型数", (run?.models || []).length]),
+    "",
+    csvRow(["模型成绩", "", "", "", "", "", "", ""]),
+    csvRow(["端点", "模型", "学科题正确率", "答对/题数", "SVG 平均星", "平均延迟ms", "Tokens", "综合"]),
+  ];
+  for (const m of run?.models || []) {
+    const st = modelStats(m);
+    lines.push(csvRow([
+      m.provider, m.model,
+      st.qRate == null ? "" : st.qRate + "%", `${st.qCorrect}/${st.qTotal}`,
+      st.svgAvgStars == null ? "" : st.svgAvgStars, st.avgLatencyMs ?? "", st.tokens,
+      st.qRate == null ? "" : (st.svgAvgStars != null ? Math.round((st.qRate + st.svgAvgStars * 20) / 2) : st.qRate),
+    ]));
+  }
+  lines.push("", csvRow(["逐题明细", "", "", "", "", "", "", "", ""]));
+  lines.push(csvRow(["时间", "端点", "模型", "题号", "题型", "结果", "期望答案", "模型答案", "延迟ms", "Tokens", "详情"]));
+  for (const r of flattenRun(run)) {
+    lines.push(csvRow([
+      new Date(r.t || Date.now()).toLocaleString("zh-CN", { hour12: false }),
+      r.provider, r.model, r.id, r.type, r.ok ? "通过" : "未通过",
+      r.expected, r.got, r.latencyMs ?? "", r.tokens ?? "", r.detail || r.error || "",
+    ]));
+  }
+  return "\ufeff" + lines.join("\r\n") + "\r\n";
+}
+
+export function buildShareText(run) {
+  const when = new Date(run?.ts || Date.now()).toLocaleString("zh-CN", { hour12: false });
+  const models = (run?.models || []).slice().sort((a, b) => (modelStats(b).qRate ?? -1) - (modelStats(a).qRate ?? -1));
+  const out = [`🧠 模型智商检测报告`, `时间：${when}`, `端点 ${run?.providerCount ?? 0} 个 · 模型 ${models.length} 个`, ""];
+  models.forEach((m, i) => {
+    const st = modelStats(m);
+    out.push(`【${i + 1}】${m.model}  @ ${m.provider}`);
+    out.push(`  学科题：${st.qRate == null ? "—" : st.qRate + "%"}（${st.qCorrect}/${st.qTotal}）`);
+    const gs = groupStats(m.q || []).map((g) => `${g.label} ${g.ok}/${g.total}`).join(" · ");
+    if (gs) out.push(`  分类：${gs}`);
+    if (st.svgJudged) out.push(`  SVG 动画：${starsText(Math.round(st.svgAvgStars))} ${st.svgAvgStars}★（${st.svgJudged} 题，均分 ${st.svgAvgScore}）`);
+    const fails = (m.q || []).filter((r) => !r.ok).slice(0, 3).map((r) => `${r.qid}`);
+    if (fails.length) out.push(`  错题：${fails.join("、")}${(m.q || []).filter((r) => !r.ok).length > 3 ? " 等" : ""}`);
+    out.push("");
+  });
+  out.push("—— 由「模型智商检测」生成");
+  return out.join("\n");
 }

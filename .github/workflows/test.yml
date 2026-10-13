@@ -6,7 +6,11 @@ on:
     paths:
       - "winapp/wwwroot/**"
       - "winapp/test/**"
-      - "winapp/ApiHealth.csproj"
+      - "winapp/IQBench.csproj"
+      - "main.py"
+      - "services.py"
+      - "bank_data.py"
+      - "tools/**"
       - ".github/workflows/**"
   pull_request:
     branches: [main]
@@ -60,7 +64,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: e2e-failure-screenshots
-          path: /tmp/*.png
+          path: winapp/test/shots/*.png
           if-no-files-found: ignore
 
   # 样式审计：字体是否真的生效、对比度、浮层定位
@@ -94,8 +98,37 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: audit-screenshots
-          path: /tmp/audit-*.png
+          path: winapp/test/shots/*.png
           if-no-files-found: ignore
+
+  # MiniApp：纯 Python，无外部依赖，秒级反馈
+  miniapp:
+    name: MiniApp 测试
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # 题库一致性校验要用 Node 跑生成器
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: 引擎单测（services.py）
+        run: python3 tools/test_miniapp.py
+
+      - name: 页面构建（stub appui）
+        run: python3 tools/test_miniapp_ui.py
+
+      - name: 校验题库两端一致
+        run: |
+          cp bank_data.py /tmp/bank_before.py
+          node tools/gen_py_bank.mjs
+          diff -q /tmp/bank_before.py bank_data.py || {
+            echo "bank_data.py 与 questions.js 不一致，请运行 node tools/gen_py_bank.mjs 后提交"; exit 1; }
 
   # 桌面壳构建：验证 C# 侧能编译通过（Windows runner）
   build-win:
@@ -120,7 +153,7 @@ jobs:
         working-directory: winapp
         shell: pwsh
         run: |
-          $exe = Get-Item "dist/ApiHealth.exe"
+          $exe = Get-Item "dist/IQBench.exe"
           if ($exe.Length -lt 1MB) { throw "exe 体积异常：$($exe.Length) bytes" }
           "exe 大小：{0:N2} MB" -f ($exe.Length / 1MB)
           # 校验 exe 里带上了自定义图标
@@ -132,5 +165,5 @@ jobs:
       - name: 上传 exe
         uses: actions/upload-artifact@v4
         with:
-          name: ApiHealth-exe
-          path: winapp/dist/ApiHealth.exe
+          name: IQBench-exe
+          path: winapp/dist/IQBench.exe

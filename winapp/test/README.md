@@ -1,56 +1,41 @@
 # 测试说明
 
-四层测试，全部是自研轻量脚本，无测试框架依赖（免安装、免配置）。
+三层测试，全部自研轻量脚本，无测试框架依赖（免安装、免配置）。
 
 ## 分层
 
 | 层 | 文件 | 作用 |
 |---|---|---|
-| mock 后端 | `mock.mjs` | 四类协议的本地模拟服务器，所有测试的共同底座 |
-| 引擎单元 | `test-engine.mjs` | 直接 import `engine.js` 打真实 HTTP，不开浏览器 |
-| UI 端到端 | `e2e-ui.mjs` | headless Edge + CDP 驱动真实 DOM |
-| 样式审计 | `audit.mjs` | 读 `getComputedStyle` 验证字体/对比度/浮层定位 |
-| 截图 | `shot.mjs` | 生成深浅主题截图（无断言） |
+| mock 后端 | `mock-api.mjs` | 静态服务 wwwroot + OpenAI 兼容接口（/v1/models、/v1/chat/completions、视觉裁判），所有测试的共同底座 |
+| CDP 驱动 | `cdp.mjs` | 零依赖 CDP 客户端：启动本机浏览器、求值、截图（WSL 下自动用 Windows 侧 Chrome/Edge） |
+| 引擎单元 | `test-engine.mjs` | 直接 import `engine.js`：判分规格、SVG 抽取/净化、裁判 JSON 解析、统计报告、并发池、HTTP 全链路 |
+| UI 端到端 | `e2e-ui.mjs` | 真实浏览器 + CDP：`?e2e=1` 钩子自动建端点、跑检测，断言时间轴/成绩单/画廊/题库真实 DOM |
+| UI 审计 | `audit.mjs` | 计算样式审计：双主题对比度 ≥4.5、键盘焦点可见、`prefers-reduced-motion`、无横向滚动、触达尺寸 ≥24px、图表 aria |
 
-## mock 后端
+## mock 后端能力
 
-`mock.mjs` 模拟四类协议，并提供**确定性的失败样本**：
-
-| 模型 | 行为 | 用途 |
-|---|---|---|
-| `mock-fast` | 正常返回 `436` | 正常路径 |
-| `mock-chat` | 正常返回中文长文 | 正常路径 |
-| `mock-down` | 固定 500 | 失败路径 / 可重试判定 |
-| `mock-empty-reasoning` | 200 但正文在 `reasoning_content` | 复现推理模型空正文 |
-| `mock-truncated` | `finish_reason=length` 正文为空 | 复现 max_tokens 截断 |
-| `mock-flaky` | 前 2 次 500，之后成功 | 验证自动重试 |
-
-并发守卫：同时请求数 `> 3` 返回 429，用于验证并发测试与上限判定。
-
-这些失败样本来自真实使用中跑出的报告，不是凭空构造的。
+- `/v1/models`：返回去重后排序的模型列表
+- 学科题：按请求里的「题目：」原文查表回答案（默认全对，便于断言 100%）
+- `mock-429`：第一次返回 429，验证退避重试
+- `mock-truncate`：返回 `finish_reason=length`，验证自动抬 `max_tokens`
+- `mock-nofinal`：只给推理不给最终答案，验证「补答」链路
+- 视觉裁判：识别含图像块的请求，返回严格 JSON 评分
+- SVG 生成：返回带 SMIL 动画的 SVG，用于帧捕获与画廊渲染
 
 ## 运行
 
 ```bash
 cd winapp
-
-# 引擎单元测试（无前置依赖）
-node test/test-engine.mjs
-
-# 端到端（需先起静态服务）
-cd wwwroot && python3 -m http.server 18099 --bind 127.0.0.1 &
-cd .. && node test/e2e-ui.mjs
-
-# 样式审计（打印 JSON + 出局部截图）
-node test/audit.mjs
-
-# 截图
-node test/shot.mjs
+node test/test-engine.mjs    # 引擎单测（无前置依赖）
+node test/e2e-ui.mjs         # 端到端（自带静态服务与 mock，无需手工起服务）
+node test/audit.mjs          # UI 审计（出深浅主题截图到 test/shots/）
 ```
+
+浏览器自动探测：WSL 找 `/mnt/c/.../chrome.exe|msedge.exe`，Linux 找 chrome/chromium；也可用 `BROWSER_PATH` 指定。
 
 ## 约定
 
-- 断言用自写的 `t(name, cond, info)` 累加 pass/fail，末尾 `process.exit(fail ? 1 : 0)`，退出码可用于 CI。
-- `engine.js` 不碰 DOM，所以能在 Node 里直接跑 —— 保持这个边界，别把 DOM 逻辑塞进引擎层。
-- e2e 用 `localStorage` 种子数据绕过 UI 输入，再用 `Page.reload` 让应用读入；断言打在真实 DOM 上。
-- 浏览器模式下 `navigator.clipboard` 用打桩，走原生桥的回退路径。
+- 断言用自写 `t(name, cond, info)` 累加 pass/fail，末尾 `process.exit(fail ? 1 : 0)`，退出码可直接用于 CI。
+- `engine.js` 不碰 DOM —— 保持这个边界，别把 DOM 逻辑塞进引擎层。
+- e2e 用 `?e2e=1&base=...&qs=...&tasks=...` 钩子种子数据并自动开跑，断言打在真实 DOM 上。
+- 截图落在 `test/shots/`，CI 失败时作为 artifact 上传。

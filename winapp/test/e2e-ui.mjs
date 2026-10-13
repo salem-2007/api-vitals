@@ -1,305 +1,124 @@
-// e2e-ui.mjs — 端到端：headless 浏览器(CDP) 驱动真实 UI 跑完整检测流程
-// 自带静态服务与 mock，无需手工起 http.server
-// 用法：node test/e2e-ui.mjs
-import { startMock } from "./mock.mjs";
-import {
-  startStatic, launchAndAttach, waitLoaded, killBrowser, closeServer, makeAssert, sleep, log,
-} from "./harness.mjs";
+// e2e-ui.mjs — 端到端：真实浏览器 + CDP 驱动真实 UI，跑一轮完整检测并断言 DOM
+import { fileURLToPath } from "node:url";
+import { dirname, join } from "node:path";
+import { mkdirSync } from "node:fs";
+import { startMock } from "./mock-api.mjs";
+import { launch, newPage, close } from "./cdp.mjs";
 
-const PORT = Number(process.env.APP_PORT || 18099);
-const MOCK_PORT = Number(process.env.MOCK_PORT || 18990);
-const APP = `http://127.0.0.1:${PORT}/index.html`;
-const MOCK = `http://127.0.0.1:${MOCK_PORT}/v1`;
-const CDP = 9400 + Math.floor(Math.random() * 400); // 随机端口：避免连上残留实例
-const PROFILE_PREFIX = "edge-e2e";
-
-// ---------- 起 mock + 静态服务 ----------
-const mock = await startMock(MOCK_PORT);
-const server = await startStatic(PORT);
-
-// ---------- 起 headless 浏览器 ----------
-const { cdp, proc } = await launchAndAttach({ port: CDP, url: APP, profilePrefix: PROFILE_PREFIX });
+const here = dirname(fileURLToPath(import.meta.url));
+const root = join(here, "..", "wwwroot");
+const shots = join(here, "shots");
+mkdirSync(shots, { recursive: true });
 
 let pass = 0, fail = 0;
-const t = (name, ok, info = "") => {
-  if (ok) { pass++; log("  PASS  " + name); }
-  else { fail++; log("  FAIL  " + name + "   " + info); }
-};
+const t = (n, c, info = "") => { if (c) pass++; else { fail++; console.log("  ✗ " + n + (info ? "  → " + info : "")); } };
+
+// 题库答案表（mock 用它逐题答对）
+const { QUESTIONS } = await import("../wwwroot/questions.js");
+const answers = {};
+for (const q of QUESTIONS) answers[q.prompt.replace(/"/g, "")] = q.answer;
+
+const mock = await startMock({ root, answers });
+console.log("mock 服务端口:", mock.port);
+const ctx = await launch({ headless: true, width: 1440, height: 900 });
+const page = await newPage(ctx);
 
 try {
-  // 等页面真正导航到 app 源（headless 新实例初始可能是 about:blank，读 localStorage 会 SecurityError）
-  const originOk = await waitLoaded(cdp, `http://127.0.0.1:${PORT}`, { appUrl: APP });
-  if (!originOk) throw new Error("页面未导航到 app 源");
-  log("== 已连上页面 ==");
+  const url = `http://127.0.0.1:${mock.port}/index.html?e2e=1&base=${encodeURIComponent(`http://127.0.0.1:${mock.port}/v1`)}&qs=Q1,Q5,Q12,Q14,Q17,Q20,Q22&tasks=svg-ecg,svg-clock&nmodels=1&conc=2`;
+  await page.goto(url);
+  console.log("已加载并触发 e2e 检测，等待完成…");
+  await page.waitFor(`document.documentElement.dataset.e2e === "done"`, 120000);
+  await page.eval("new Promise(r=>setTimeout(r,600))");
 
-  // 0) 配置迁移：真实旧配置里 concurN=1 + 残留 ramp 字段 → 应被纠正
-  await cdp.ev(`(() => {
-    localStorage.setItem("ah_settings", JSON.stringify({
-      timeoutMs:60000, connectTimeoutMs:15000, latencyN:3, concurN:1, gapMs:150,
-      recordLimit:300, theme:"auto",
-      tests:{connect:true,latency:true,stream:true,tps:true,concur:true,ramp:true},
-      rampLevels:"1,2,3,6", rampPerLevel:2
-    }));
-    return "old-settings";
-  })()`);
-  await cdp.send("Page.reload");
-  await sleep(2000);
-  const migrated = await cdp.ev(`(() => {
-    const s = AH.state.settings;
-    return { concurN: s.concurN, hasRamp: ("rampLevels" in s) || ("rampPerLevel" in s), testRamp: ("ramp" in (s.tests||{})), retries: s.retries };
-  })()`);
-  log("  迁移结果：" + JSON.stringify(migrated));
-  t("旧配置 concurN=1 被纠正为 >=2", migrated.concurN >= 2, "concurN=" + migrated.concurN);
-  t("废弃的 ramp 字段被清理", !migrated.hasRamp && !migrated.testRamp, JSON.stringify(migrated));
-  t("重试次数有默认值", migrated.retries === 1, "retries=" + migrated.retries);
+  // ---- 基础 DOM ----
+  t("标题正确", (await page.eval("document.title")).includes("模型智商检测"));
+  t("品牌在", await page.eval("!!document.querySelector('.brand-name')"));
+  t("端点已渲染", (await page.eval("document.querySelectorAll('.prov').length")) >= 1);
+  t("题库侧栏有 22 项", (await page.eval("document.querySelectorAll('#qList input').length")) === 22);
 
-  // 1) 注入端点 + 参数（浏览器模式走 localStorage 回退）
-  await cdp.ev(`(() => {
-    const providers = [{
-      id: "e2e1", name: "mock-openai", type: "openai", baseUrl: "${MOCK}",
-      apiKey: "sk-test", enabled: true, models: [],
-      selModels: ["mock-fast", "mock-chat"]   // 避开 mock-down(500)，专测正常路径
-    }];
-    const settings = {
-      timeoutMs: 30000, connectTimeoutMs: 10000, latencyN: 3,
-      concurN: 2, gapMs: 0,
-      tests: { connect: true, latency: true, stream: true, tps: true, concur: true }
-    };
-    // 提示词不带 expect：并发阶梯会轮换所有提示词，而 mock 的固定回复无法同时满足多个期望值
-    // （关键词校验逻辑已由 test-engine.mjs 单元测试覆盖）
-    const prompts = [
-      { label: "连通性问句", user: "随便说点什么", expect: null },
-      { label: "短问答", user: "1+1 等于几", expect: null }
-    ];
-    localStorage.setItem("ah_providers", JSON.stringify(providers));
-    localStorage.setItem("ah_settings", JSON.stringify(settings));
-    localStorage.setItem("ah_prompts", JSON.stringify(prompts));
-    localStorage.removeItem("ah_history");
-    return "seeded";
-  })()`);
-  await cdp.send("Page.reload");
-  await sleep(2500);
+  // ---- 时间轴 ----
+  const tl = await page.eval("document.querySelectorAll('#timeline .tl-item').length");
+  t("时间轴有记录", tl > 8, "items=" + tl);
+  t("时间轴含答对条目", await page.eval("[...document.querySelectorAll('#timeline .tl-kind')].some(e=>e.textContent.includes('答对'))"));
+  t("时间轴含画图条目", await page.eval("[...document.querySelectorAll('#timeline .tl-kind')].some(e=>e.textContent.includes('画图'))"));
+  t("时间轴含裁判条目", await page.eval("[...document.querySelectorAll('#timeline .tl-kind')].some(e=>e.textContent.includes('裁判'))"));
 
-  const title = await cdp.ev(`document.querySelector('.brand')?.textContent || ''`);
-  t("页面加载 + 品牌渲染", title.includes("API VITALS"), title);
+  // ---- 生成文件预览 ----
+  t("预览区出现 SVG 图片", await page.eval("!!document.querySelector('#genbox img')"));
 
-  const provCount = await cdp.ev(`document.querySelectorAll('#providers .prov').length`);
-  t("端点卡片渲染", provCount === 1, "prov=" + provCount);
+  // ---- 状态栏 ----
+  const status = await page.eval("document.querySelector('#statusText').textContent");
+  t("状态栏显示完成", /完成/.test(status), status);
 
-  // 2) 触发快速检测
-  await cdp.ev(`document.querySelector('#btnRunQuick').click(); "clicked"`);
-  log("  已点击「快速检测」，等待完成…");
+  // ---- 切到成绩单 ----
+  await page.eval(`document.querySelector('#tabs button[data-tab="results"]').click()`);
+  await page.eval("new Promise(r=>setTimeout(r,300))");
+  t("成绩单有卡片", (await page.eval("document.querySelectorAll('#view-results .card').length")) >= 1);
+  const score = await page.eval("document.querySelector('#view-results .score')?.textContent");
+  t("IQ 分为 100", score === "100", "score=" + score);
+  t("成绩单有对比图", await page.eval("!!document.querySelector('#view-results svg[role=img]')"));
+  const trs = await page.eval("document.querySelectorAll('#view-results tbody tr[data-key]').length");
+  t("逐题表有 7 行", trs === 7, "rows=" + trs);
+  await page.eval("document.querySelector('#view-results tbody tr[data-key]').click()");
+  await page.eval("new Promise(r=>setTimeout(r,200))");
+  t("展开行显示原始输出", await page.eval("!!document.querySelector('#view-results tr.detail-row pre')"));
 
-  let status = "", waited = 0;
-  for (;;) {
-    await sleep(1000); waited++;
-    status = await cdp.ev(`document.querySelector('#statusText').textContent`);
-    if (/^(完成|已停止|异常)/.test(status)) break;
-    if (waited > 150) break;
-  }
-  t("检测流程跑到完成", /^完成/.test(status), status);
-  log("  状态栏：" + status);
+  // ---- 切到画廊 ----
+  await page.eval(`document.querySelector('#tabs button[data-tab="gallery"]').click()`);
+  await page.eval("new Promise(r=>setTimeout(r,300))");
+  const gcards = await page.eval("document.querySelectorAll('#view-gallery .gcard').length");
+  t("画廊有 2 个作品", gcards === 2, "cards=" + gcards);
+  t("画廊作品是图片", (await page.eval("document.querySelectorAll('#view-gallery .pane img').length")) >= 2);
+  t("画廊显示评分", await page.eval("[...document.querySelectorAll('#view-gallery .pill')].some(e=>/\\d+ 分/.test(e.textContent))"));
+  t("画廊显示星级", await page.eval("[...document.querySelectorAll('#view-gallery .stars')].some(e=>e.textContent.includes('★'))"));
+  t("画廊有维度清单", (await page.eval("document.querySelectorAll('#view-gallery .crit').length")) >= 3);
+  t("画廊有动画帧", (await page.eval("document.querySelectorAll('#view-gallery .frames img').length")) >= 3);
 
-  // 记录页默认是「按模型汇总」视图；逐用例断言先切到「按用例流水」
-  await cdp.ev(`(() => {
-    const tab = [...document.querySelectorAll('#view-records .chip[data-mode]')].find(b => b.dataset.mode === 'case');
-    if (tab) tab.click();
-    return !!tab;
-  })()`);
-  await sleep(200);
+  // ---- 切到题库 ----
+  await page.eval(`document.querySelector('#tabs button[data-tab="bank"]').click()`);
+  await page.eval("new Promise(r=>setTimeout(r,300))");
+  t("题库页列出 22 题", (await page.eval("document.querySelectorAll('#view-bank .qitem').length")) === 22 + 8);
+  t("题库页显示标准答案", await page.eval("[...document.querySelectorAll('#view-bank .qitem-answer')].some(e=>e.textContent.includes('29'))"));
 
-  // 3) 结果断言
-  const res = await cdp.ev(`(() => {
-    const rows = [...document.querySelectorAll('#view-records tbody tr[data-idx]')].map(tr =>
-      [...tr.querySelectorAll('td')].map(td => td.textContent.trim()));
-    return {
-      rowCount: rows.length,
-      kinds: [...new Set(rows.map(r => r[2].replace(/\\s*聚合$/, '')))],
-      pass: rows.filter(r => r[4] === '通过').length,
-      fail: rows.filter(r => r[4] === '失败').length,
-      hud: document.querySelector('#hudStats')?.textContent || '',
-      vitals: document.querySelectorAll('#vitals .vit').length,
-      lamp: document.querySelector('#providers .lamp')?.className || '',
-      chartCount: document.querySelectorAll('[_echarts_instance_]').length,
-      historyRows: document.querySelectorAll('#view-history tbody tr').length,
-      errors: rows.slice(0, 3).map(r => r[2] + ' → ' + r[8]),
-    };
-  })()`);
-  log("  记录行数=" + res.rowCount + " 通过=" + res.pass + " 失败=" + res.fail + " 测试类型=" + JSON.stringify(res.kinds));
-  log("  前 3 条详情：" + JSON.stringify(res.errors));
+  // ---- 报告 ----
+  const csv = await page.eval("window.AH && (()=>{const r=window.AH.state.runs[0];return r? (r.models[0].q.length+'|'+r.models[0].svg.length):'none';})()");
+  t("runs 状态含 7 题 2 图", csv === "7|2", csv);
 
-  t("产生了测试记录", res.rowCount > 0, JSON.stringify(res));
-  t("全部通过（mock 正常路径）", res.fail === 0 && res.pass > 0, `pass=${res.pass} fail=${res.fail}`);
-  t("覆盖 5 类检测", ["连通", "对话", "延迟", "流式", "速率", "并发"].every((k) => res.kinds.includes(k)), JSON.stringify(res.kinds));
-  t("端点状态灯变绿", res.lamp.includes("ok"), res.lamp);
-  t("仪表盘体征卡渲染", res.vitals === 1, "vitals=" + res.vitals);
-  t("图表实例已创建", res.chartCount >= 4, "charts=" + res.chartCount);
-  t("历史已存档", res.historyRows >= 1, "history=" + res.historyRows);
+  // ---- 交互：右键菜单 ----
+  await page.eval(`document.querySelector('#tabs button[data-tab="results"]').click()`);
+  await page.eval(`(()=>{const tr=document.querySelector('#view-results tbody tr[data-key]');const r=tr.getBoundingClientRect();tr.dispatchEvent(new MouseEvent('contextmenu',{bubbles:true,clientX:r.left+10,clientY:r.top+10}));})()`);
+  await page.eval("new Promise(r=>setTimeout(r,200))");
+  t("右键菜单打开", await page.eval("!!document.querySelector('.ctxmenu')"));
+  await page.eval("document.dispatchEvent(new KeyboardEvent('keydown',{key:'Escape'}))");
 
-  // 4) 并发测试（开关打开、并发 2 < mock 守卫阈值 3 → 应全部通过）
-  const concurRow = await cdp.ev(`(() => {
-    const tr = [...document.querySelectorAll('#view-records tbody tr')]
-      .find(t => t.children[2]?.textContent.includes('并发'));
-    return tr ? { detail: tr.children[8]?.textContent.trim(), lat: tr.children[5]?.textContent.trim() } : null;
-  })()`);
-  log("  并发详情：" + JSON.stringify(concurRow));
-  t("并发测试产生了结论", !!concurRow && /并发 2 · 通过 2\/2/.test(concurRow.detail || ""), JSON.stringify(concurRow));
-  t("并发给出了延迟分布", !!concurRow && /p50 \d+ \/ p95 \d+/.test(concurRow.lat || ""), concurRow && concurRow.lat);
+  // ---- 截图 ----
+  await page.eval(`document.querySelector('#tabs button[data-tab="monitor"]').click()`);
+  await page.eval("new Promise(r=>setTimeout(r,400))");
+  await page.screenshot(join(shots, "e2e-monitor.png"));
+  await page.eval(`document.querySelector('#tabs button[data-tab="results"]').click()`);
+  await page.eval("new Promise(r=>setTimeout(r,400))");
+  await page.screenshot(join(shots, "e2e-results.png"));
+  await page.eval(`document.querySelector('#tabs button[data-tab="gallery"]').click()`);
+  await page.eval("new Promise(r=>setTimeout(r,400))");
+  await page.screenshot(join(shots, "e2e-gallery.png"));
+  console.log("截图已保存到 test/shots/");
 
-  // 4.1) 并发开关的开关语义：关掉开关后配置页写回 tests.concur=false
-  const toggleOk = await cdp.ev(`(() => {
-    AH.toggleConcur(false);
-    return AH.state.settings.tests.concur === false;
-  })()`);
-  t("并发开关可关闭", toggleOk === true, "toggled=" + toggleOk);
-  await cdp.ev(`AH.toggleConcur(true); "on"`);
+  t("mock 收到视觉请求", mock.state.calls.vision >= 2, "vision=" + mock.state.calls.vision);
+  t("mock 收到模型列表请求", mock.state.calls.models >= 1);
 
-  // 5) 右键菜单：端点卡片 / 记录行 / 图表
-  const ctx = await cdp.ev(`(() => {
-    const el = document.querySelector('#providers .prov');
-    el.dispatchEvent(new MouseEvent('contextmenu', { bubbles: true, clientX: 120, clientY: 120 }));
-    const menu = document.querySelector('.ctxmenu');
-    const labels = menu ? [...menu.querySelectorAll('.ctx-item')].map(b => b.textContent.replace(/\\s+/g,'').trim()) : [];
-    return { shown: !!menu, title: menu?.querySelector('.ctx-title')?.textContent || '', labels };
-  })()`);
-  log("  端点右键菜单：" + JSON.stringify(ctx.labels));
-  t("端点右键菜单弹出", ctx.shown === true, JSON.stringify(ctx));
-  t("菜单含编辑/检测/获取模型/复制/删除",
-    ["编辑端点…", "检测此端点"].every((k) => ctx.labels.includes(k)) &&
-    ctx.labels.some((l) => l.startsWith("获取模型列表")) &&
-    ctx.labels.some((l) => l.startsWith("复制BaseURL")) &&
-    ctx.labels.some((l) => l.startsWith("删除端点")),
-    JSON.stringify(ctx.labels));
-
-  // 点菜单里的「获取模型列表」→ 应真的拉到 mock 的 3 个模型
-  const fetched = await cdp.ev(`(async () => {
-    const btn = [...document.querySelectorAll('.ctxmenu .ctx-item')].find(b => b.textContent.includes('获取模型列表'));
-    btn.click();
-    await new Promise(r => setTimeout(r, 900));
-    return { models: (AH.state.providers[0].models || []), menuGone: !document.querySelector('.ctxmenu') };
-  })()`);
-  log("  右键获取模型：" + JSON.stringify(fetched.models));
-  t("右键获取模型列表生效", fetched.models.length === 3 && fetched.models.includes("mock-fast"), JSON.stringify(fetched));
-  t("点菜单后菜单自动关闭", fetched.menuGone === true);
-
-  // 记录行右键
-  const recCtx = await cdp.ev(`(() => {
-    const tr = document.querySelector('#view-records tbody tr');
-    tr.dispatchEvent(new MouseEvent('contextmenu', { bubbles: true, clientX: 200, clientY: 200 }));
-    const menu = document.querySelector('.ctxmenu');
-    return { shown: !!menu, n: menu ? menu.querySelectorAll('.ctx-item').length : 0 };
-  })()`);
-  t("记录行右键菜单弹出", recCtx.shown && recCtx.n >= 5, JSON.stringify(recCtx));
-  await cdp.ev(`document.dispatchEvent(new MouseEvent('click', { bubbles: true })); "close"`);
-
-  // 6) 剪贴板识别 → 填入表单（浏览器模式：桩掉 navigator.clipboard）
-  //    用 mock 地址，这样紧接着的「获取模型」能真的连上
-  const clip = await cdp.ev(`(async () => {
-    Object.defineProperty(navigator, 'clipboard', {
-      configurable: true,
-      value: { readText: async () => "中转A\\nhttp://127.0.0.1:18990/v1/chat/completions\\nsk-testkey1234567890abcdef", writeText: async () => {} }
-    });
-    document.querySelector('#btnAddProv').click();
-    await new Promise(r => setTimeout(r, 700));
-    const tip = document.querySelector('.conn-tip');
-    const txt = tip ? tip.textContent : '';
-    if (tip) tip.querySelector('#ct_fill').click();
-    await new Promise(r => setTimeout(r, 120));
-    return {
-      tipShown: !!tip, txt,
-      base: document.querySelector('#f_base')?.value || '',
-      key: document.querySelector('#f_key')?.value || '',
-      type: document.querySelector('#f_type')?.value || '',
-    };
-  })()`);
-  log("  剪贴板识别：" + JSON.stringify({ shown: clip.tipShown, base: clip.base, key: clip.key, type: clip.type }));
-  t("添加端点时识别到剪贴板连接信息", clip.tipShown === true, JSON.stringify(clip));
-  t("剪贴板 URL 已归一化到 /v1", clip.base === MOCK.replace(/\/chat\/completions$/, ""), clip.base);
-  t("剪贴板 Key 已填入", clip.key === "sk-testkey1234567890abcdef", clip.key);
-
-  // 6.1) 编辑端点 → 获取模型 → 勾选为测试模型 → 保存
-  const editFlow = await cdp.ev(`(async () => {
-    const modalOpen = !!document.querySelector('#f_fetch');
-    document.querySelector('#f_fetch').click();          // 弹窗里点「获取模型」
-    await new Promise(r => setTimeout(r, 1200));
-    const rows = [...document.querySelectorAll('#f_modellist .model-row')];
-    const fast = rows.find(r => r.textContent.includes('mock-fast'));
-    if (!fast) return { modalOpen, rows: rows.length, err: document.querySelector('.toast')?.textContent || '', listHtml: (document.querySelector('#f_modellist')?.textContent || '').slice(0, 80) };
-    fast.querySelector('input').click();                  // 勾选 mock-fast
-    const cnt = document.querySelector('#f_selcount').textContent;
-    const search = document.querySelector('#f_search');
-    search.value = 'mock-do'; search.dispatchEvent(new Event('input', { bubbles: true }));
-    const visible = [...document.querySelectorAll('#f_modellist .model-row')].filter(r => !r.classList.contains('hidden')).length;
-    search.value = ''; search.dispatchEvent(new Event('input', { bubbles: true }));
-    document.querySelector('.modal-actions .btn.primary').click();  // 保存
-    await new Promise(r => setTimeout(r, 400));
-    const p = AH.state.providers[AH.state.providers.length - 1];
-    return { modalOpen, rows: rows.length, cnt, visible, saved: p.selModels || [], base: p.baseUrl, name: p.name };
-  })()`);
-  log("  编辑端点获取模型：" + JSON.stringify(editFlow));
-  t("弹窗里「获取模型」渲染出可选模型", editFlow.rows === 3, JSON.stringify(editFlow));
-  t("勾选后计数更新", editFlow.cnt === "1", "cnt=" + editFlow.cnt);
-  t("模型搜索过滤可用", editFlow.visible === 1, "visible=" + editFlow.visible);
-  t("勾选的模型保存进 selModels", editFlow.saved.includes("mock-fast"), JSON.stringify(editFlow.saved));
-  t("保存时 BaseURL 保持端点根地址", editFlow.base === MOCK, editFlow.base);
-
-  // 7) 报告导出内容：端点 API/Key + 成功模型 / 失败模型 + 明细
-  const report = await cdp.ev(`(() => {
-    const r = AH.state.runs[0];
-    const csv = AH.buildReport(r);
-    return { len: csv.length, csv: csv.slice(0, 4000) };
-  })()`);
-  const hasAll = ["端点汇总", "模型结果", "用例明细", "BaseURL", "APIKey", "成功模型", "失败模型", "失败原因"]
-    .every((k) => report.csv.includes(k));
-  t("报告含端点/API/Key/成功模型/失败模型/明细",
-    hasAll && report.csv.includes("mock-openai") && report.csv.includes("mock-fast"), 
-    "len=" + report.len);
-
-  // 8) 筛选与 CSV 导出路径可用（切到「按用例流水」用失败筛选）
-  const filtered = await cdp.ev(`(() => {
-    const caseTab = [...document.querySelectorAll('#view-records .chip[data-mode]')].find(b => b.dataset.mode === 'case');
-    if (caseTab) caseTab.click();
-    const failChip = [...document.querySelectorAll('#view-records .chip[data-f2]')].find(b => b.dataset.f2 === 'fail');
-    if (failChip) failChip.click();
-    return document.querySelectorAll('#view-records tbody tr[data-idx]').length;
-  })()`);
-  t("失败筛选可用", filtered === 0, "failRows=" + filtered);
-  const chips = await cdp.ev(`[...document.querySelectorAll('#view-records .chip')].map(c => c.textContent.trim())`);
-  t("记录页有导出报告入口", chips.some((c) => c.includes("导出报告")), JSON.stringify(chips));
-
-  // 8.1) 按模型汇总视图：应聚合出模型行，且状态含「成功」，点行可展开用例
-  const modelView = await cdp.ev(`(() => {
-    const modelTab = [...document.querySelectorAll('#view-records .chip[data-mode]')].find(b => b.dataset.mode === 'model');
-    modelTab.click();
-    const rows = [...document.querySelectorAll('#view-records tbody tr[data-model]')];
-    const first = rows[0];
-    const statuses = rows.map(r => r.children[2]?.textContent.trim());
-    first?.click();
-    const expanded = !!document.querySelector('#view-records .detail-row');
-    return { rowCount: rows.length, statuses: [...new Set(statuses)], expanded };
-  })()`);
-  log("  按模型汇总：" + JSON.stringify(modelView));
-  t("按模型汇总产生模型行", modelView.rowCount >= 2, JSON.stringify(modelView));
-  t("模型行显示三态状态", modelView.statuses.includes("成功"), JSON.stringify(modelView.statuses));
-  t("点模型行可展开用例明细", modelView.expanded === true, "expanded=" + modelView.expanded);
-
-  // 8.2) 历史页新列：模型数 / 部分 / 失败主因 表头存在
-  const histHead = await cdp.ev(`(() => {
-    document.querySelector('.tabs button[data-tab="history"]').click();
-    return [...document.querySelectorAll('#view-history thead th')].map(th => th.textContent.trim());
-  })()`);
-  log("  历史表头：" + JSON.stringify(histHead));
-  t("历史页含模型/部分/失败主因列", ["模型", "部分", "失败主因"].every((k) => histHead.includes(k)), JSON.stringify(histHead));
 } catch (e) {
   fail++;
-  log("  FAIL  端到端异常: " + e.message);
+  console.log("  ✗ 端到端异常: " + (e && e.message));
+  try { await page.screenshot(join(shots, "e2e-fail.png")); } catch { /* noop */ }
+  try {
+    const errs = await page.eval("JSON.stringify(window.__errs||[])");
+    console.log("  页面错误:", errs);
+  } catch { /* noop */ }
 } finally {
-  await killBrowser(proc, PROFILE_PREFIX);
-  closeServer(server);
-  try { mock.close(); } catch {}
-  try { cdp.ws.close(); } catch {}
+  page.close();
+  await close(ctx);
+  mock.close();
 }
 
-log("");
-log(fail === 0 ? `端到端全部通过：${pass} PASS` : `${pass} PASS / ${fail} FAIL`);
+console.log(`\n端到端结果：${pass} 通过 / ${fail} 失败`);
 process.exit(fail ? 1 : 0);
