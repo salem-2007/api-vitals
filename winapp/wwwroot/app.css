@@ -484,3 +484,6 @@ tr.detail-row td { background: color-mix(in srgb, var(--bg2) 60%, transparent); 
 .fp-item-title { font-size: var(--fs-sm); font-weight: 600; display: flex; gap: 6px; align-items: baseline; flex-wrap: wrap; }
 .fp-item-ev { font-size: var(--fs-sm); color: var(--text2); margin-top: 2px; word-break: break-word; }
 @media (max-width: 900px) { .fp-why { grid-template-columns: 1fr; } }
+
+/* ---------- 按钮行 ---------- */
+.btn-row { display: flex; gap: 6px; flex-wrap: wrap; }

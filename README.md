@@ -1,5 +1,11 @@
 # 模型智商检测 · IQ Bench
 
+[![GitHub stars](https://img.shields.io/github/stars/salem-2007/api-vitals?style=social)](https://github.com/salem-2007/api-vitals)
+[![GitHub last commit](https://img.shields.io/github/last-commit/salem-2007/api-vitals)](https://github.com/salem-2007/api-vitals)
+[![License](https://img.shields.io/github/license/salem-2007/api-vitals)](https://github.com/salem-2007/api-vitals)
+
+> 项目仓库：[github.com/salem-2007/api-vitals](https://github.com/salem-2007/api-vitals) · 喜欢的话点颗星 ⭐
+
 面向 **OpenAI 兼容 / Anthropic / Gemini** 接口的模型能力测评桌面工具。
 两类测试并行覆盖「会算」与「会画」：
 

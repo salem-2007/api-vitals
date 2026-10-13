@@ -44,6 +44,16 @@ async function storeSave(name, obj) {
   } catch { /* 回退 */ }
   try { localStorage.setItem("iq_" + name, s); } catch { /* 无存储 */ }
 }
+// 打开外链：原生壳走 openUrl 桥（Program.cs 只放行 http/https），浏览器模式回退 window.open
+async function openUrl(url) {
+  if (inWV) {
+    try {
+      const r = await invoke("openUrl", { data: url });
+      if (r && r.ok) return;
+    } catch { /* 回退 */ }
+  }
+  try { window.open(url, "_blank", "noopener"); } catch { toast("无法打开链接：" + url, "bad"); }
+}
 async function clipRead() {
   try {
     const r = await invoke("clipread");
@@ -155,6 +165,8 @@ const S = {
 };
 
 const $ = (s) => document.querySelector(s);
+const GITHUB_REPO = "https://github.com/salem-2007/api-vitals";
+const openGithub = (suffix = "") => openUrl(GITHUB_REPO + suffix);
 const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 const hhmmss = (ts) => new Date(ts).toLocaleTimeString("zh-CN", { hour12: false });
 const uid = () => "p" + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
@@ -1456,6 +1468,10 @@ function bindStatic() {
   $("#btnStop").addEventListener("click", stopRun);
   $("#btnShare").addEventListener("click", shareModal);
   $("#themeToggle").addEventListener("click", cycleTheme);
+  $("#btnGithub")?.addEventListener("click", () => openGithub());
+  $("#btnStar")?.addEventListener("click", () => { openGithub(); toast("给项目点颗星支持一下 ⭐", "ok"); });
+  $("#btnRepo")?.addEventListener("click", () => openGithub());
+  $("#btnIssue")?.addEventListener("click", () => openGithub("/issues/new"));
   $("#btnAddProv").addEventListener("click", addProvider);
   $("#btnFetchProv").addEventListener("click", async () => {
     for (const p of S.providers) await fetchModelsFor(p.id);
@@ -1546,6 +1562,10 @@ function bindStatic() {
       { sep: true },
       { label: "切换主题", fn: cycleTheme },
       { label: "打开数据目录", fn: () => invoke("openDataDir") },
+      { sep: true },
+      { label: "★ Star 本项目", fn: () => openGithub() },
+      { label: "GitHub 仓库", fn: () => openGithub() },
+      { label: "反馈 Issue", fn: () => openGithub("/issues/new") },
     ]);
   });
   document.addEventListener("click", (e) => { if (_menuEl && !_menuEl.contains(e.target)) closeMenu(); }, true);
@@ -1613,7 +1633,10 @@ function bindStatic() {
     const r = await invoke("sysinfo");
     if (r && r.ok && r.data) {
       const info = JSON.parse(r.data);
-      if (info.ver) { const el = $("#verText"); if (el) el.textContent = "v" + info.ver; }
+      if (info.ver) {
+        const el = $("#verText"); if (el) el.textContent = "v" + info.ver;
+        const vs = $("#verShort"); if (vs) vs.textContent = "v" + info.ver;
+      }
     }
   } catch { /* 浏览器模式 */ }
 })();
@@ -1624,4 +1647,5 @@ window.AH = {
   histRows, renderHist, histStep, setHistSub,
   parseConn: parseConnText, renderAll, questions: QUESTIONS, tasks: SVG_TASKS,
   histRows, renderHist, histStep, setHistSub, renderForensics, probes: PROBE_ITEMS, layers: PROBE_LAYERS,
+  openUrl, openGithub, GITHUB_REPO,
 };
