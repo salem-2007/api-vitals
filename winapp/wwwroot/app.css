@@ -487,3 +487,8 @@ tr.detail-row td { background: color-mix(in srgb, var(--bg2) 60%, transparent); 
 
 /* ---------- 按钮行 ---------- */
 .btn-row { display: flex; gap: 6px; flex-wrap: wrap; }
+
+/* ---------- 关于弹窗 ---------- */
+.about-sec { margin-bottom: 12px; }
+.about-sec > b { display: block; font-size: var(--fs-sm); color: var(--muted); margin-bottom: 4px; letter-spacing: .3px; }
+.about-sec p { margin: 0; font-size: var(--fs-sm); color: var(--text2); line-height: 1.6; }

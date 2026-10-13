@@ -1417,6 +1417,45 @@ function providerMenu(id, e) {
   ]);
 }
 
+// ==================== 关于 ====================
+function appVersion() {
+  const el = $("#verText"); if (el && el.textContent) return el.textContent;
+  return "v" + (window.AH?.__ver || "0.4.0");
+}
+function aboutModal() {
+  const ver = appVersion();
+  const body = `
+    <div style="display:flex;align-items:center;gap:12px;margin-bottom:12px">
+      <span style="font-size:34px;line-height:1">🧠</span>
+      <div>
+        <div style="font-size:18px;font-weight:700">模型智商检测 · IQ Bench</div>
+        <div class="sub">版本 ${esc(ver)} · 开源 · MIT License</div>
+      </div>
+    </div>
+    <div class="about-sec">
+      <b>这是什么</b>
+      <p>一套本地运行的模型能力测评工具：22 道学科推理题（本地自动判分）、8 道 SVG 动画生成题（AI 视觉裁判）、7 层 20 项模型指纹探针（含数值指纹归因），一次检测跑出模型的智商分、画图能力与真实性评分。</p>
+    </div>
+    <div class="about-sec">
+      <b>项目仓库</b>
+      <p class="mono" style="word-break:break-all">github.com/salem-2007/api-vitals</p>
+    </div>
+    <div class="about-sec">
+      <b>第三方与致谢</b>
+      <p>数值指纹归因的算法与指纹库来自 <b>ModelTrace</b>（<span class="mono">github.com/xqy2006/ModelTrace</span>，MIT License, © 2026 xqy2006）。</p>
+    </div>
+    <div class="about-sec">
+      <b>免责声明</b>
+      <p class="sub">测评结果（IQ 分 / SVG 星级 / 真实性评分）只代表特定题库、提示词、采样参数与测试时间下的表现，不构成对模型真实能力、安全性或商业价值的权威认定。</p>
+    </div>`;
+  showModal("关于", body, [
+    { label: "反馈 Issue", fn: () => openGithub("/issues/new") },
+    { label: "GitHub 仓库", fn: () => openGithub() },
+    { label: "★ Star", cls: "primary", fn: () => { openGithub(); toast("感谢支持 ⭐", "ok"); } },
+    { label: "关闭", fn: hideModal },
+  ]);
+}
+
 // ==================== 报告 / 分享 ====================
 function exportCsv() {
   const run = currentRun();
@@ -1472,6 +1511,7 @@ function bindStatic() {
   $("#btnStar")?.addEventListener("click", () => { openGithub(); toast("给项目点颗星支持一下 ⭐", "ok"); });
   $("#btnRepo")?.addEventListener("click", () => openGithub());
   $("#btnIssue")?.addEventListener("click", () => openGithub("/issues/new"));
+  $("#btnAbout")?.addEventListener("click", aboutModal);
   $("#btnAddProv").addEventListener("click", addProvider);
   $("#btnFetchProv").addEventListener("click", async () => {
     for (const p of S.providers) await fetchModelsFor(p.id);
@@ -1647,5 +1687,5 @@ window.AH = {
   histRows, renderHist, histStep, setHistSub,
   parseConn: parseConnText, renderAll, questions: QUESTIONS, tasks: SVG_TASKS,
   histRows, renderHist, histStep, setHistSub, renderForensics, probes: PROBE_ITEMS, layers: PROBE_LAYERS,
-  openUrl, openGithub, GITHUB_REPO,
+  openUrl, openGithub, GITHUB_REPO, aboutModal,
 };

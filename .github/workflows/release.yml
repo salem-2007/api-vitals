@@ -64,7 +64,7 @@ jobs:
             - **IQBench.exe** — Windows 单文件客户端，需要 .NET 10 桌面运行时
               （未安装可先装 [.NET Desktop Runtime 10](https://dotnet.microsoft.com/download/dotnet/10.0)）
 
-            双击运行即可，无需解压。前端资源（含字体与图标）已内嵌。
+            双击运行即可，无需解压。前端资源（含图标与 ModelTrace 数值指纹库）已内嵌。
 
             ## 校验
 
@@ -76,11 +76,19 @@ jobs:
 
             ## 首次使用
 
-            1. 左侧「+ 添加端点」或「批量导入」
-            2. 填 BaseURL 与 API Key（剪贴板里有连接信息会自动提示填入）
-            3. 点「获取模型」，勾选要测的模型
-            4. 「快速检测」跑一遍；需要并发压测就打开「并发」开关
-            5. 「记录」页看明细，可导出报告表格
+            1. 左侧「+ 添加端点」，填 BaseURL 与 API Key（只写域名会自动补 `/v1`）
+            2. 点「拉模型」，勾选要测的模型（不勾 = 自动取前 2 个）
+            3. 侧栏确认测试项：学科题逐题勾选、`测试 SVG 动画题`、`运行指纹探针`
+            4. 点右上角「开始检测」；跑完看「成绩单」「SVG 画廊」「指纹鉴定」
+            5. 「分享」一键生成报告；「答题记录」里可用 ← → 逐条翻看
+
+            ## 功能
+
+            - 22 道学科推理题（本地自动判分，支持 AI 复核 / 人工改判）
+            - 8 道 SVG 动画生成题（AI 视觉裁判按维度打分）
+            - 7 层 20 项模型指纹探针（含 ModelTrace 数值指纹归因，鉴别套壳/降智）
+            - 思考等级支持（reasoning_effort / thinking budget / thinkingConfig）
+            - 报告与导出均不含 API Key
           files: |
             winapp/dist/IQBench.exe
             winapp/dist/SHA256SUMS.txt
