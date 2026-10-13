@@ -32,6 +32,7 @@ DEFAULT_CFG = {
     "rl_base": 5,            # 429 首次等待（秒）
     "rl_cap": 120,           # 429 单次等待上限（秒）
     "threads": 2,            # 同一模型内并发答题数
+    "thinking": "off",       # 思考等级：off / low / medium / high（OpenAI 兼容 = reasoning_effort）
 }
 
 # ==================== 归一化与判分（对齐 engine.js）====================
@@ -234,15 +235,20 @@ def _parse_chat(resp):
     return content, usage.get("completion_tokens"), str(ch.get("finish_reason") or "")
 
 
-def chat(base_url, api_key, model, system, user, cfg, max_tokens=None, temperature=0.0):
+def chat(base_url, api_key, model, system, user, cfg, max_tokens=None, temperature=0.0, max_field="max_tokens"):
     """单次对话（不含重试）。返回 dict：ok/content/tokens/latency/error/status"""
     url = base_url.rstrip("/") + "/chat/completions"
     payload = {
         "model": model,
         "messages": ([{"role": "system", "content": system}] if system else []) + [{"role": "user", "content": user}],
-        "max_tokens": int(max_tokens or cfg["max_tokens"]),
-        "temperature": float(temperature),
+        max_field: int(max_tokens or cfg["max_tokens"]),
     }
+    # 思考等级：reasoning_effort（开启时省略 temperature，多数推理端点 temperature 只接受 1）
+    thinking = str(cfg.get("thinking") or "off")
+    if thinking != "off":
+        payload["reasoning_effort"] = thinking
+    else:
+        payload["temperature"] = float(temperature)
     t0 = time.time()
     try:
         resp = _post(url, api_key, payload, cfg["timeout"])
@@ -263,8 +269,9 @@ def chat_retry(base_url, api_key, model, system, user, cfg, max_tokens=None,
     ceiling = max(int(max_tokens or cfg["max_tokens"]), int(cfg["max_tokens_ceiling"]))
     limit = int(max_tokens or cfg["max_tokens"])
     rl, normal = 0, 0
+    max_field = "max_tokens"
     while True:
-        r = chat(base_url, api_key, model, system, user, cfg, max_tokens=limit, temperature=temperature)
+        r = chat(base_url, api_key, model, system, user, cfg, max_tokens=limit, temperature=temperature, max_field=max_field)
         if r["ok"]:
             if str(r.get("finish", "")).lower() == "length" and limit < ceiling:
                 prev = limit
@@ -274,6 +281,14 @@ def chat_retry(base_url, api_key, model, system, user, cfg, max_tokens=None,
             r["rl_retries"] = rl
             return r
         st = r.get("status") or 0
+        if st == 400 and max_field == "max_tokens" and ("max_tokens" in r["error"] or "max_completion_tokens" in r["error"]):
+            max_field = "max_completion_tokens"
+            note("端点拒收 max_tokens（400），已自动改用 max_completion_tokens 重发")
+            continue
+        if "超时" in r["error"] or "timed out" in r["error"].lower() or "timeout" in r["error"].lower():
+            note("请求超时（%s）" % r["error"][:80])
+            r["timed_out"] = True
+            return r
         if st == 429 and rl < int(cfg["rl_retries"]):
             rl += 1
             wait = cfg["rl_base"] * (2 ** min(rl - 1, 6))

@@ -30,6 +30,14 @@ export function pct(arr, p) {
   return Math.round(a[i]);
 }
 export const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+// 可被 abort 打断的 sleep：429 退避等待期间点「停止」能立刻响应
+export function sleepAbort(ms, signal) {
+  return new Promise((r) => {
+    if (signal?.aborted) return r();
+    const t = setTimeout(r, ms);
+    if (signal) signal.addEventListener("abort", () => { clearTimeout(t); r(); }, { once: true });
+  });
+}
 export const starsFromScore = (score) => Math.max(0, Math.min(5, Math.round((Number(score) || 0) / 20)));
 export const starsText = (n) => "★".repeat(Math.max(0, Math.min(5, n | 0))) + "☆".repeat(5 - Math.max(0, Math.min(5, n | 0)));
 
@@ -179,7 +187,7 @@ export const ADAPTERS = {
     modelsUrl: (p) => trimBase(p.baseUrl) + "/models",
     parseModels: (j) => (j?.data || []).map((x) => (typeof x === "string" ? x : x?.id)).filter(Boolean).map(String),
     chatUrl: (p) => trimBase(p.baseUrl) + "/chat/completions",
-    buildMessages(model, { system, user, parts, maxTokens, temperature, extra }) {
+    buildMessages(model, { system, user, parts, maxTokens, temperature, extra, maxTokensField, thinking }) {
       const messages = [];
       if (system) messages.push({ role: "system", content: system });
       if (parts) {
@@ -192,7 +200,12 @@ export const ADAPTERS = {
       } else {
         messages.push({ role: "user", content: user ?? "" });
       }
-      return { model, messages, max_tokens: maxTokens, temperature, ...(extra || {}) };
+      const b = { model, messages, [maxTokensField || "max_tokens"]: maxTokens, ...(extra || {}) };
+      // 思考等级：reasoning_effort（o 系列 / gpt-5 系）。开启时省略 temperature
+      // （多数推理端点 temperature 只接受 1，发 0 会直接 400）
+      if (thinking && thinking !== "off") b.reasoning_effort = thinking;
+      else b.temperature = temperature;
+      return b;
     },
     parseChat(j) {
       const ch = j?.choices?.[0] || {};
@@ -216,8 +229,19 @@ export const ADAPTERS = {
     modelsUrl: (p) => trimBase(p.baseUrl || ADAPTERS.anthropic.defaultBase()) + "/v1/models",
     parseModels: (j) => (j?.data || []).map((x) => (typeof x === "string" ? x : x?.id)).filter(Boolean).map(String),
     chatUrl: (p) => trimBase(p.baseUrl || ADAPTERS.anthropic.defaultBase()) + "/v1/messages",
-    buildMessages(model, { system, user, parts, maxTokens, temperature, extra }) {
-      const b = { model, max_tokens: maxTokens, temperature, ...(extra || {}) };
+    buildMessages(model, { system, user, parts, maxTokens, temperature, extra, thinking }) {
+      const b = { model, max_tokens: maxTokens, ...(extra || {}) };
+      // 思考等级：extended thinking 预算。开启时 Anthropic 强制 temperature=1，
+      // 且 budget_tokens 必须小于 max_tokens —— 不够就自动抬高 max_tokens
+      if (thinking && thinking !== "off") {
+        const budget = { low: 1024, medium: 4096, high: 16384 }[thinking] || 4096;
+        b.thinking = { type: "enabled", budget_tokens: budget };
+        b.temperature = 1;
+        if ((b.max_tokens || 0) <= budget) b.max_tokens = budget + 4096;
+      } else {
+        b.thinking = { type: "disabled" };
+        b.temperature = temperature;
+      }
       if (system) b.system = system;
       if (parts) {
         b.messages = [{
@@ -248,8 +272,16 @@ export const ADAPTERS = {
     modelsUrl: (p) => gb(p) + "/models",
     parseModels: (j) => (j?.models || []).map((m) => String(m?.name || "").replace(/^models\//, "")).filter(Boolean),
     chatUrl: (p, model) => gb(p) + "/models/" + encodeURIComponent(model) + ":generateContent",
-    buildMessages(model, { system, user, parts, maxTokens, temperature, extra }) {
+    buildMessages(model, { system, user, parts, maxTokens, temperature, extra, thinking }) {
       const b = { generationConfig: { maxOutputTokens: maxTokens, temperature }, ...(extra || {}) };
+      // 思考等级：2.5 系用 thinkingBudget，3 系用 thinkingLevel
+      if (thinking && thinking !== "off") {
+        if (/gemini-3/.test(String(model || "").toLowerCase())) {
+          b.generationConfig.thinkingConfig = { thinkingLevel: { low: "LOW", medium: "MEDIUM", high: "HIGH" }[thinking] || "MEDIUM" };
+        } else {
+          b.generationConfig.thinkingConfig = { thinkingBudget: { low: 1024, medium: 8192, high: 32768 }[thinking] || 8192 };
+        }
+      }
       if (system) b.systemInstruction = { parts: [{ text: system }] };
       if (parts) {
         b.contents = [{
@@ -373,12 +405,16 @@ export async function callChatRetry(p, model, payloadOpts, cfg = {}, opts = {}) 
   const rlCap = Math.max(rlBase, cfg.rlCapSec ?? 120);
   const ceiling = Math.max(payloadOpts.maxTokens || 2048, cfg.maxTokensCeiling ?? 8192);
   const onNote = opts.onNote || (() => {});
+  // 关键：超时在 cfg 里，必须显式转发给 callChat，否则 fetch 一直用默认 120s，
+  // 表现为「超时设置无效 / 长请求没反应」
+  const timeoutMs = cfg.timeoutMs ?? opts.timeoutMs ?? 120000;
   let maxTokens = payloadOpts.maxTokens || 2048;
+  let mtField = payloadOpts.maxTokensField || null;   // null = max_tokens
   let rl = 0, normal = 0;
   for (;;) {
     if (opts.signal?.aborted) return { ok: false, content: "", tokens: null, latencyMs: 0, error: "已取消", rlRetries: rl };
     try {
-      const r = await callChat(p, model, { ...payloadOpts, maxTokens }, opts);
+      const r = await callChat(p, model, { ...payloadOpts, maxTokens, maxTokensField: mtField }, { ...opts, timeoutMs });
       if (String(r.finish).toLowerCase() === "length" && maxTokens < ceiling) {
         const prev = maxTokens;
         maxTokens = Math.min(maxTokens * 2, ceiling);
@@ -388,18 +424,32 @@ export async function callChatRetry(p, model, payloadOpts, cfg = {}, opts = {}) 
       return { ok: true, ...r, maxTokensUsed: maxTokens, rlRetries: rl };
     } catch (e) {
       const st = e?.status || 0;
+      const msg = String(e?.message || e);
+      // OpenAI 新端点（o 系列 / gpt-5 系 / 部分中转）拒收 max_tokens，要求 max_completion_tokens：
+      // 400 且错误提到字段名时自动换字段重发一次，两种端点都能吃
+      if (st === 400 && !mtField && /max_completion_tokens|max_tokens/.test(msg) && (p?.type || "openai") === "openai") {
+        mtField = "max_completion_tokens";
+        onNote("端点拒收 max_tokens（400），已自动改用 max_completion_tokens 重发");
+        continue;
+      }
       if (st === 429 && rl < rlMax) {
         rl++;
         const ra = parseFloat(e.retryAfter);
         const wait = isFinite(ra) && ra > 0 ? Math.min(ra, rlCap) : Math.min(rlBase * 2 ** Math.min(rl - 1, 6), rlCap);
         onNote(`遇到 429 限流，等待 ${Math.round(wait)}s 后重试（第 ${rl} 次）`);
-        await sleep(wait * 1000);
+        await sleepAbort(wait * 1000, opts.signal);
         continue;
+      }
+      // 超时不重试：一次超时立刻返回，绝不静默重试几分钟把界面拖成「没反应」
+      if (/超时|timed\s*out|timeout/i.test(msg)) {
+        onNote(`请求超时（${msg.slice(0, 80)}）`);
+        return { ok: false, content: "", tokens: null, latencyMs: 0, status: st, error: msg, rlRetries: rl, timedOut: true };
       }
       const retryable = st === 0 || st === 429 || st >= 500;
       if (retryable && normal < retries) {
         normal++;
-        await sleep(Math.min(2 ** normal, 8) * 1000);
+        onNote(`请求失败（${msg.slice(0, 90)}），${Math.min(2 ** normal, 8)}s 后重试（第 ${normal}/${retries} 次）`);
+        await sleepAbort(Math.min(2 ** normal, 8) * 1000, opts.signal);
         continue;
       }
       return { ok: false, content: "", tokens: null, latencyMs: 0, status: st, error: String(e?.message || e), rlRetries: rl };
@@ -420,6 +470,7 @@ export async function opAskQuestion(p, model, q, cfg = {}, opts = {}) {
     user: buildQuestionPrompt(q),
     maxTokens: cfg.maxTokens ?? 2048,
     temperature: cfg.temperature ?? 0,
+    thinking: cfg.thinking || "off",
   }, cfg, { ...opts, onNote: opts.onNote });
   row.latencyMs = Date.now() - t0;
   if (!res.ok) { row.error = res.error || "请求失败"; row.rlRetries = res.rlRetries || 0; return row; }
@@ -462,6 +513,7 @@ export async function opGenSvg(p, model, task, cfg = {}, opts = {}) {
     user: buildSvgPrompt(task),
     maxTokens: cfg.svgMaxTokens ?? 8192,
     temperature: cfg.svgTemperature ?? 0.4,
+    thinking: cfg.thinking || "off",
   }, { ...cfg, retries: Math.min(1, cfg.retries ?? 1) }, { ...opts, onNote: opts.onNote });
   row.latencyMs = Date.now() - t0;
   if (!res.ok) { row.error = res.error || "请求失败"; return row; }

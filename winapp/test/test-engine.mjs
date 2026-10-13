@@ -343,5 +343,48 @@ section("数值指纹：库匹配与边界");
 
 probeMock.close();
 
+
+// ---------------- 思考等级 / 字段降级 / 超时 ----------------
+section("思考等级 / max_tokens 降级 / 超时不重试");
+{
+  const { ADAPTERS } = await import("../wwwroot/engine.js");
+  const o = ADAPTERS.openai.buildMessages("gpt-5", { system: "s", user: "u", maxTokens: 100, temperature: 0, thinking: "high" });
+  t("openai 思考等级发 reasoning_effort", o.reasoning_effort === "high" && !("temperature" in o), JSON.stringify(o));
+  const o2 = ADAPTERS.openai.buildMessages("gpt-5", { user: "u", maxTokens: 100, temperature: 0, maxTokensField: "max_completion_tokens" });
+  t("openai 换字段发 max_completion_tokens", "max_completion_tokens" in o2 && !("max_tokens" in o2), JSON.stringify(o2));
+  const a = ADAPTERS.anthropic.buildMessages("claude", { user: "u", maxTokens: 2000, temperature: 0, thinking: "medium" });
+  t("anthropic 思考等级发 thinking budget + 强制温度 1", a.thinking?.type === "enabled" && a.thinking?.budget_tokens === 4096 && a.temperature === 1, JSON.stringify(a));
+  t("anthropic 关思考发 disabled", ADAPTERS.anthropic.buildMessages("claude", { user: "u", maxTokens: 2000, temperature: 0 }).thinking?.type === "disabled");
+  const g = ADAPTERS.gemini.buildMessages("gemini-2.5-pro", { user: "u", maxTokens: 100, temperature: 0, thinking: "low" });
+  t("gemini 2.5 思考等级发 thinkingBudget", g.generationConfig.thinkingConfig?.thinkingBudget === 1024, JSON.stringify(g.generationConfig));
+  const g3 = ADAPTERS.gemini.buildMessages("gemini-3-pro", { user: "u", maxTokens: 100, temperature: 0, thinking: "high" });
+  t("gemini 3 思考等级发 thinkingLevel", g3.generationConfig.thinkingConfig?.thinkingLevel === "HIGH", JSON.stringify(g3.generationConfig));
+
+  const m = await startMock({ root: join(here, "..", "wwwroot"), answers: probeAnswers });
+  const pb = "http://127.0.0.1:" + m.port + "/v1";
+  const prov = { name: "m", type: "openai", baseUrl: pb, apiKey: "k" };
+  const c = { maxTokens: 256, temperature: 0, retries: 2, rlRetries: 2, rlBaseSec: 1, rlCapSec: 1, maxTokensCeiling: 2048, timeoutMs: 60000 };
+  const notes = [];
+  const r = await opAskQuestion(prov, "mock-maxcomp", QUESTIONS[0], c, { onNote: (x) => notes.push(x) });
+  t("max_tokens 被拒后自动换 max_completion_tokens 成功", r.ok === true, JSON.stringify({ ok: r.ok, err: r.error }));
+  t("降级发出 note", notes.some((x) => /max_completion_tokens/.test(x)), notes.join(" | "));
+  t("慢端点请求了 ≥2 次（首次 400 + 重发）", m.state.calls.maxcomp >= 2, m.state.calls.maxcomp);
+
+  // 超时：一次超时立即返回，不重试
+  const slowCfg = { ...c, timeoutMs: 300 };
+  const t0 = Date.now();
+  const rr = await opAskQuestion(prov, "mock-slow", QUESTIONS[0], slowCfg, {});
+  const elapsed = Date.now() - t0;
+  t("超时立即返回（错误含超时）", rr.ok === false && /超时/.test(rr.error), rr.error);
+  t("超时不重试（仅 1 次请求）", m.state.calls.slow === 1, m.state.calls.slow);
+  t("超时返回快（<1.5s，没有等 3 次重试）", elapsed < 1500, elapsed + "ms");
+
+  // 思考等级 + 探针不影响：数值指纹强制第一反应（thinking 不参与）
+  const ti = await opAskQuestion(prov, "mock-thinking", QUESTIONS[0], { ...c, thinking: "medium" }, {});
+  t("思考等级请求体里带 reasoning_effort", m.state.lastThinkingBody?.reasoning_effort === "medium", JSON.stringify(m.state.lastThinkingBody));
+  t("思考模型的推理内容不影响判分", ti.ok === true, ti.got);
+  m.close();
+}
+
 console.log(`\n结果：${pass} 通过 / ${fail} 失败`);
 process.exit(fail ? 1 : 0);

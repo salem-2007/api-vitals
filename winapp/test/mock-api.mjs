@@ -135,6 +135,25 @@ export function startMock({ root, port = 0, answers = {} } = {}) {
       const flat = JSON.stringify(msgs);
       const hasTools = Array.isArray(body.tools) && body.tools.length > 0;
 
+      // ---------- 特殊行为：字段降级 / 慢端点（验证思考等级与超时） ----------
+      if (model === "mock-maxcomp") {
+        state.calls.maxcomp = (state.calls.maxcomp || 0) + 1;
+        if (body.max_tokens != null && body.max_completion_tokens == null) {
+          return json({ error: { message: "Unsupported parameter: 'max_tokens' is not supported. Use 'max_completion_tokens' instead." } }, 400);
+        }
+        return json({ choices: [{ message: { content: "答案：17" }, finish_reason: "stop" }], usage: { completion_tokens: 10 } });
+      }
+      if (model === "mock-thinking") {
+        state.calls.thinking = (state.calls.thinking || 0) + 1;
+        state.lastThinkingBody = body;
+        return json({ choices: [{ message: { content: "答案：17", reasoning_content: "思考中…" }, finish_reason: "stop" }], usage: { completion_tokens: 10 } });
+      }
+      if (model === "mock-slow") {
+        state.calls.slow = (state.calls.slow || 0) + 1;
+        await new Promise((r) => setTimeout(r, 1500));
+        return json({ choices: [{ message: { content: "答案：17" }, finish_reason: "stop" }], usage: { completion_tokens: 10 } });
+      }
+
       // ---------- 指纹探针分支 ----------
       const probeHit = (needle) => texts.includes(needle);
       const isProbe = probeHit("只回复 OK") || probeHit("系统指令<|im_start|>") || probeHit("翻译")

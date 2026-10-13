@@ -51,6 +51,12 @@
         <label class="mini-field"><span>超时(秒)</span><input id="cfgTimeout" type="number" min="10" max="600" step="10"></label>
         <label class="mini-field"><span>最大 Tokens</span><input id="cfgMaxTok" type="number" min="256" max="32768" step="256"></label>
         <label class="mini-field"><span>失败重试</span><input id="cfgRetries" type="number" min="0" max="5" step="1"></label>
+        <label class="mini-field"><span>思考等级</span><select id="cfgThinking">
+          <option value="off">关（默认）</option>
+          <option value="low">低</option>
+          <option value="medium">中</option>
+          <option value="high">高</option>
+        </select></label>
         <label class="chk"><input type="checkbox" id="cfgJudge" checked><span>启用视觉裁判（SVG 题）</span></label>
         <label class="chk"><input type="checkbox" id="cfgSvgOn" checked><span>测试 SVG 动画题</span></label>
         <label class="chk"><input type="checkbox" id="cfgProbeOn" checked><span>运行指纹探针（7 层）</span></label>

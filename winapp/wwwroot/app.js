@@ -139,7 +139,7 @@ const DEFAULT_SETTINGS = {
   concurrency: 2, timeoutSec: 120, maxTokens: 4096, retries: 2,
   svgMaxTokens: 8192, svgTemperature: 0.4, judgeMaxTokens: 2048,
   judgeOn: true, svgOn: true, judgeModel: "", theme: "auto", followLog: true,
-  probeOn: true, numberfpMaxTokens: 2048,
+  probeOn: true, numberfpMaxTokens: 2048, thinking: "off",
   qEnabled: {}, taskEnabled: {},
 };
 const S = {
@@ -186,8 +186,17 @@ function cycleTheme() {
 mqDark.addEventListener("change", () => { if ((S.settings.theme || "auto") === "auto") applyTheme(); });
 
 // ==================== 通用 UI ====================
-function setStatus(t) { S.status = t; const el = $("#statusText"); if (el) el.textContent = t; }
-function setProgress(t) { S.progress = t; const el = $("#progressText"); if (el) el.textContent = t; }
+function setStatus(t) { S.status = t; renderStatusBar(); }
+function setProgress(t) { S.progress = t; renderStatusBar(); }
+// 统一渲染：运行中且无更具体进度时显示「本阶段已耗时」秒表，避免长请求/超时等待期间界面像死了
+function renderStatusBar() {
+  const st = $("#statusText"); if (st) st.textContent = S.status;
+  const pg = $("#progressText");
+  if (!pg) return;
+  if (S.progress) { pg.textContent = S.progress; return; }
+  if (S.running && S.phaseT0) pg.textContent = `已耗时 ${Math.round((Date.now() - S.phaseT0) / 1000)}s`;
+  else pg.textContent = "";
+}
 let toastSeq = 0;
 function toast(msg, kind) {
   const el = document.createElement("div");
@@ -499,6 +508,7 @@ function renderProviders() {
 }
 function markTesting(id, phase) { S.runCursor = id ? { id, phase: phase || "检测中" } : null; renderProviders(); }
 function setPhase(phase) {
+  S.phaseT0 = Date.now();
   if (!S.runCursor) return;
   S.runCursor.phase = phase;
   const node = document.querySelector(`.prov[data-id="${S.runCursor.id}"] .prov-phase`);
@@ -558,11 +568,15 @@ function resolveJudge(testedP, testedModel) {
   return p ? { p, model: parts.slice(1).join("::") } : { p: testedP, model: testedModel };
 }
 
+let _tickTimer = null;
+function startTick() { stopTick(); _tickTimer = setInterval(() => { if (S.running) renderStatusBar(); }, 1000); }
+function stopTick() { if (_tickTimer) { clearInterval(_tickTimer); _tickTimer = null; } }
+
 // ==================== 检测编排 ====================
 function cfgOf() {
   const s = S.settings;
   return {
-    maxTokens: s.maxTokens, temperature: 0, retries: s.retries,
+    maxTokens: s.maxTokens, temperature: 0, retries: s.retries, thinking: s.thinking || "off",
     svgMaxTokens: s.svgMaxTokens, svgTemperature: s.svgTemperature,
     judgeMaxTokens: s.judgeMaxTokens, rlRetries: 6, rlBaseSec: 5, rlCapSec: 120,
     maxTokensCeiling: Math.max(s.maxTokens * 2, 8192),
@@ -585,6 +599,8 @@ async function runAll() {
   S.abort = new AbortController();
   S.doneIds = new Set();
   S.running = true;
+  S.phaseT0 = Date.now();
+  startTick();
   $("#btnRun").disabled = true;
   $("#btnStop").disabled = false;
   log("开始", `检测开始 · 端点 ${targets.length} · 学科题 ${qs.length} · SVG 题 ${tasks.length}${probeOn ? " · 指纹探针 " + PROBE_ITEMS.length + " 项" : ""}`,
@@ -714,6 +730,9 @@ async function runAll() {
   }
 
   S.running = false;
+  stopTick();
+  S.phaseT0 = 0;
+  renderStatusBar();
   S.runCursor = null;
   S.doneIds = null;
   $("#btnRun").disabled = false;
@@ -729,8 +748,8 @@ async function runAll() {
   run.judgeOn = judgeOn;
   run.qCount = qTotal; run.qCorrect = qCorrect; run.svgCount = svgCount; run.probeCount = probeCount;
   S.runs.unshift(run);
-  if (S.runs.length > 60) S.runs.length = 60;
-  await storeSave("runs", S.runs);
+  if (S.runs.length > 20) S.runs.length = 20;
+  await storeSave("runs", slimForStore(S.runs));
   S.runFilter = null;
   renderAll();
 
@@ -982,7 +1001,24 @@ async function retest(m, r) {
   log(row.ok ? "重测答对" : "重测答错", `${m.model} · ${r.qid}`, row.got || row.error || "", row.ok ? "ok" : "bad");
 }
 
-async function persistRuns() { await storeSave("runs", S.runs); }
+// 落盘前剥掉「可重算的派生数据」：SVG 截帧（base64 PNG，每帧上百 KB）
+// 与原始长文本。它们能从 svg / 重新请求得到，留在 runs.json 里会让文件膨胀到 MB 级，
+// 每次启动解析都会卡死界面。
+function slimForStore(runs) {
+  return (runs || []).map((run) => ({
+    ...run,
+    models: (run.models || []).map((m) => ({
+      ...m,
+      q: (m.q || []).map((r) => ({ ...r, raw: (r.raw || "").slice(0, 600), content: undefined })),
+      svg: (m.svg || []).map((r) => ({ ...r, frames: undefined, raw: (r.raw || "").slice(0, 2000) })),
+      probes: m.probes ? {
+        ...m.probes,
+        items: (m.probes.items || []).map((it) => ({ ...it, detail: undefined })),
+      } : undefined,
+    })),
+  }));
+}
+async function persistRuns() { await storeSave("runs", slimForStore(S.runs)); }
 
 function barChart(items, { title, unit = "", max = null } = {}) {
   if (!items.length) return "";
@@ -1445,6 +1481,11 @@ function bindStatic() {
   bindNum("#cfgTimeout", "timeoutSec", 10, 600);
   bindNum("#cfgMaxTok", "maxTokens", 256, 32768);
   bindNum("#cfgRetries", "retries", 0, 5);
+  const tk = $("#cfgThinking");
+  if (tk) {
+    tk.value = S.settings.thinking || "off";
+    tk.addEventListener("change", () => { S.settings.thinking = tk.value; storeSave("settings", S.settings); });
+  }
   const jEl = $("#cfgJudge");
   jEl.checked = S.settings.judgeOn;
   jEl.addEventListener("change", (e) => { S.settings.judgeOn = e.target.checked; storeSave("settings", S.settings); });
@@ -1520,7 +1561,24 @@ function bindStatic() {
     qEnabled: { ...DEFAULT_SETTINGS.qEnabled, ...(st.qEnabled || {}) },
     taskEnabled: { ...DEFAULT_SETTINGS.taskEnabled, ...(st.taskEnabled || {}) },
   };
-  S.runs = (await storeLoad("runs", [])) || [];
+  const rawRuns = (await storeLoad("runs", [])) || [];
+  // 清洗历史数据：旧版本把 base64 帧写进了 runs.json（可达 1.8MB），启动解析会卡死界面
+  let cleaned = 0;
+  S.runs = rawRuns.map((run) => ({
+    ...run,
+    models: (run.models || []).map((m) => {
+      const svg = (m.svg || []).map((r) => {
+        if (r.frames) { cleaned++; return { ...r, frames: undefined }; }
+        return r;
+      });
+      return { ...m, svg };
+    }),
+  }));
+  if (cleaned) {
+    // 立刻回写精简版，避免下次启动再解析一遍
+    setTimeout(() => { storeSave("runs", slimForStore(S.runs)); }, 0);
+    try { console.warn("[iqbench] 已清洗", cleaned, "处历史 base64 帧"); } catch { /* noop */ }
+  }
   applyTheme();
   bindStatic();
   renderAll();
