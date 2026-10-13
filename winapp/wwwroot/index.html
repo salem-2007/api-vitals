@@ -53,6 +53,7 @@
         <label class="mini-field"><span>失败重试</span><input id="cfgRetries" type="number" min="0" max="5" step="1"></label>
         <label class="chk"><input type="checkbox" id="cfgJudge" checked><span>启用视觉裁判（SVG 题）</span></label>
         <label class="chk"><input type="checkbox" id="cfgSvgOn" checked><span>测试 SVG 动画题</span></label>
+        <label class="chk"><input type="checkbox" id="cfgProbeOn" checked><span>运行指纹探针（7 层）</span></label>
       </div>
     </div>
 
@@ -98,6 +99,9 @@
       <button data-tab="bank">
         <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 5a2 2 0 0 1 2-2h12v18H6a2 2 0 0 0-2 2Z"/><path d="M4 5v14"/></svg>题库
       </button>
+      <button data-tab="forensics">
+        <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3l8 4.5v9L12 21l-8-4.5v-9z"/><path d="M12 12l8-4.5M12 12v9M12 12L4 7.5"/></svg>指纹鉴定
+      </button>
     </nav>
 
     <div class="views">
@@ -111,10 +115,17 @@
             </div>
             <div class="timeline" id="timeline"></div>
           </div>
-          <!-- 右：生成文件 / 实时预览 -->
+          <!-- 右：生成文件 / 答题记录（可上下翻看） -->
           <div class="panel">
-            <div class="panel-head"><span>生成文件</span><span class="hint-inline" id="genHint">模型写入后自动预览</span></div>
+            <div class="panel-head">
+              <span class="subtabs">
+                <button class="subtab active" data-sub="gen">生成文件</button>
+                <button class="subtab" data-sub="hist">答题记录</button>
+              </span>
+              <span class="hint-inline" id="genHint">模型写入后自动预览</span>
+            </div>
             <div class="genbox" id="genbox"></div>
+            <div class="histbox hidden" id="histbox"></div>
           </div>
         </div>
       </div>
@@ -122,6 +133,7 @@
       <div class="view hidden" id="view-results"></div>
       <div class="view hidden" id="view-gallery"></div>
       <div class="view hidden" id="view-bank"></div>
+      <div class="view hidden" id="view-forensics"></div>
     </div>
   </section>
 </main>

@@ -4,6 +4,7 @@ import {
   listModels, opAskQuestion, opGenSvg, opJudgeSvg, opJudgeAnswer, runPool,
   modelStats, groupStats, runStats, flattenRun, buildReportCsv, buildShareText,
   starsText, sanitizeSvg, ensureSvgSize, svgDataUrl, sleep,
+  PROBE_LAYERS, PROBE_ITEMS, opRunProbes, layerProbes,
 } from "./engine.js";
 
 // ==================== 桥接（WebView2 原生壳 / 浏览器回退） ====================
@@ -138,6 +139,7 @@ const DEFAULT_SETTINGS = {
   concurrency: 2, timeoutSec: 120, maxTokens: 4096, retries: 2,
   svgMaxTokens: 8192, svgTemperature: 0.4, judgeMaxTokens: 2048,
   judgeOn: true, svgOn: true, judgeModel: "", theme: "auto", followLog: true,
+  probeOn: true, numberfpMaxTokens: 2048,
   qEnabled: {}, taskEnabled: {},
 };
 const S = {
@@ -149,6 +151,7 @@ const S = {
   expanded: new Set(),
   runFilter: null,
   runCursor: null, doneIds: null,
+  hist: { idx: -1, follow: true, sub: "gen" },   // 答题记录浏览器
 };
 
 const $ = (s) => document.querySelector(s);
@@ -279,6 +282,149 @@ function renderGen() {
   } else {
     el.innerHTML = `<img alt="${esc(g.title || "生成文件")}" src="${svgDataUrl(g.svg)}">`;
   }
+}
+
+// ==================== 答题记录浏览器（运行中可上下翻看） ====================
+function histRows() {
+  const run = currentRun();
+  if (!run || !run.models) return [];
+  const out = [];
+  for (const m of run.models) {
+    for (const r of m.q || []) out.push({ kind: "q", provider: m.provider, model: m.model, r });
+    for (const r of m.svg || []) out.push({ kind: "svg", provider: m.provider, model: m.model, r });
+    if (m.probes) out.push({ kind: "fp", provider: m.provider, model: m.model, r: m.probes });
+  }
+  return out;
+}
+
+function renderHist() {
+  const box = $("#histbox");
+  if (!box) return;
+  const rows = histRows();
+  if (!rows.length) {
+    box.innerHTML = `<div class="hist-empty">还没有答题记录<br>点「开始检测」后这里会实时累积，可上下翻看</div>`;
+    return;
+  }
+  const last = rows.length - 1;
+  const idx = S.hist.follow ? last : Math.max(0, Math.min(S.hist.idx, last));
+  S.hist.idx = idx;
+  const cur = rows[idx];
+
+  const head = `<div class="hist-pager">
+    <button class="btn tiny" id="histPrev" ${idx <= 0 ? "disabled" : ""}>◀ 上一条</button>
+    <span class="hist-count"><b>${idx + 1}</b> / ${rows.length}</span>
+    <button class="btn tiny" id="histNext" ${idx >= last ? "disabled" : ""}>下一条 ▶</button>
+    <span class="spacer"></span>
+    <label class="chk tight" title="开启后自动跳到最新一条">
+      <input type="checkbox" id="histFollow" ${S.hist.follow ? "checked" : ""}><span>跟随最新</span>
+    </label>
+    ${S.running ? `<span class="pill info">运行中</span>` : ""}
+  </div>`;
+
+  const r = cur.r;
+  let chips = "", rowsHtml = "", raw = "";
+  if (cur.kind === "q") {
+    chips = `<span class="badge">${esc(cur.model)}</span>
+      <span class="badge">${esc(r.qid)}</span>
+      <span class="badge">${esc(r.type)}</span>
+      <span class="pill ${r.ok ? "ok" : "bad"}">${r.ok ? "答对" : "答错"}</span>
+      ${r.manual ? `<span class="pill mute">人工改判</span>` : ""}
+      ${r.aiReview ? `<span class="pill info">AI 复核</span>` : ""}
+      ${r.followup ? `<span class="pill warn">含补答</span>` : ""}`;
+    rowsHtml = `
+      <div class="hist-row"><span>期望答案</span><b>${esc(r.expected)}</b></div>
+      <div class="hist-row"><span>模型答案</span><b>${esc(r.got || "—")}</b></div>
+      <div class="hist-row"><span>判定方式</span><b>${esc(r.gradeHow || "—")}</b></div>
+      <div class="hist-row"><span>延迟/Token</span><b>${r.latencyMs}ms · ${r.tokens ?? "—"}</b></div>
+      <div class="hist-row"><span>时间</span><b>${hhmmss(r.t || Date.now())}</b></div>
+      ${r.error ? `<div class="hist-row"><span>错误</span><b style="color:var(--danger)">${esc(r.error)}</b></div>` : ""}`;
+    raw = r.raw || "（无原始输出）";
+  } else if (cur.kind === "fp") {
+    const fp = r;
+    chips = `<span class="badge">${esc(cur.model)}</span>
+      <span class="badge">指纹探针</span>
+      <span class="pill ${fp.score >= 85 ? "ok" : fp.score >= 60 ? "warn" : "bad"}">真实性 ${fp.score} 分 · ${fp.verdict}</span>`;
+    rowsHtml = fp.layers.map((l) => {
+      const meta = PROBE_LAYERS.find((x) => x.key === l.key) || {};
+      const cls = l.verdict === "通过" ? "var(--accent)" : l.verdict === "可疑" ? "var(--warn)" : "var(--danger)";
+      return `<div class="hist-row"><span>${esc((meta.icon || "") + " " + (meta.title || l.key))}</span><b style="color:${cls}">${l.verdict}（异常 ${l.bad} / 可疑 ${l.warn} / 通过 ${l.ok}）</b></div>`;
+    }).join("");
+    const bads = fp.items.filter((x) => x.level === "bad" || x.level === "warn").slice(0, 6);
+    raw = bads.length
+      ? bads.map((x) => "【" + x.level.toUpperCase() + "】" + x.title + "\n" + x.evidence).join("\n\n")
+      : "7 层探针全部通过，未发现套壳/降智证据。";
+  } else {
+    const j = r.judge;
+    chips = `<span class="badge">${esc(cur.model)}</span>
+      <span class="badge">SVG</span>
+      <span class="badge">${esc(r.title || r.taskId)}</span>
+      ${j ? `<span class="pill ${j.score >= 80 ? "ok" : j.score >= 60 ? "warn" : "bad"}">${j.score} 分</span><span class="stars">${starsText(j.stars)}</span>` : `<span class="pill mute">未评审</span>`}`;
+    rowsHtml = `
+      <div class="hist-row"><span>总评</span><b>${esc(j ? j.verdict : r.error || "—")}</b></div>
+      <div class="hist-row"><span>动画</span><b>${r.motion == null ? "—" : (r.motion ? "有" : "无")} · ${(r.frames || []).length} 帧</b></div>
+      <div class="hist-row"><span>延迟/Token</span><b>${r.latencyMs}ms · ${r.tokens ?? "—"}</b></div>
+      <div class="hist-row"><span>裁判</span><b>${esc(r.judgeModel || "—")}</b></div>
+      <div class="hist-row"><span>时间</span><b>${hhmmss(r.t || Date.now())}</b></div>`;
+    raw = r.svg || r.raw || "（无 SVG）";
+  }
+
+  const list = rows.map((x, i) => {
+    const rr = x.r;
+    const ok = x.kind === "q" ? rr.ok : x.kind === "fp" ? rr.score >= 85 : !!(rr.judge && rr.judge.score >= 60);
+    const label = x.kind === "q" ? `${rr.qid} ${rr.type}`
+      : x.kind === "fp" ? `指纹 ${rr.verdict} ${rr.score}分` : `SVG ${rr.title || rr.taskId}`;
+    return `<div class="hist-item ${i === idx ? "active" : ""}" data-hi="${i}">
+      <span class="mk" style="color:${ok ? "var(--accent)" : "var(--danger)"}">${ok ? "✓" : "✕"}</span>
+      <span class="hi-id">${esc(x.kind === "q" ? rr.qid : x.kind === "fp" ? "FP" : "SVG")}</span>
+      <span class="hi-model">${esc(x.model)} · ${esc(label)}</span>
+      <span class="sub">${x.kind === "fp" ? (rr.durationMs ? (rr.durationMs / 1000).toFixed(1) + "s" : "") : (rr.latencyMs ?? "") + "ms"}</span>
+    </div>`;
+  }).join("");
+
+  box.innerHTML = head +
+    `<div class="hist-detail">
+      <div class="hist-meta">${chips}</div>
+      <div class="hist-rows">${rowsHtml}</div>
+      <pre>${esc(raw)}</pre>
+    </div>
+    <div class="hist-list" id="histList">${list}</div>`;
+
+  $("#histPrev")?.addEventListener("click", () => histStep(-1));
+  $("#histNext")?.addEventListener("click", () => histStep(1));
+  $("#histFollow")?.addEventListener("change", (e) => {
+    S.hist.follow = e.target.checked;
+    if (S.hist.follow) S.hist.idx = histRows().length - 1;
+    renderHist();
+  });
+  box.querySelectorAll("[data-hi]").forEach((el) => el.addEventListener("click", () => {
+    S.hist.follow = false;
+    S.hist.idx = Number(el.dataset.hi);
+    renderHist();
+  }));
+  const active = box.querySelector(".hist-item.active");
+  if (active && S.hist.follow) active.scrollIntoView({ block: "nearest" });
+}
+
+function histStep(delta) {
+  const rows = histRows();
+  if (!rows.length) return;
+  const last = rows.length - 1;
+  let idx = S.hist.follow ? last : Math.max(0, Math.min(S.hist.idx, last));
+  idx = Math.max(0, Math.min(idx + delta, last));
+  S.hist.follow = false;
+  S.hist.idx = idx;
+  renderHist();
+}
+
+function setHistSub(sub) {
+  S.hist.sub = sub === "hist" ? "hist" : "gen";
+  document.querySelectorAll(".subtab").forEach((b) => b.classList.toggle("active", b.dataset.sub === S.hist.sub));
+  const gen = $("#genbox"), hist = $("#histbox");
+  if (gen) gen.classList.toggle("hidden", S.hist.sub !== "gen");
+  if (hist) hist.classList.toggle("hidden", S.hist.sub !== "hist");
+  const hint = $("#genHint");
+  if (hint) hint.textContent = S.hist.sub === "hist" ? "← → 可上下翻看" : "模型写入后自动预览";
+  if (S.hist.sub === "hist") renderHist();
 }
 
 // ==================== 帧捕获（canvas） ====================
@@ -430,7 +576,8 @@ async function runAll() {
   if (!targets.length) { toast("没有可测的端点/模型：先添加端点并「拉模型」勾选模型", "bad"); return; }
   const qs = enabledQuestions();
   const tasks = S.settings.svgOn ? enabledTasks() : [];
-  if (!qs.length && !tasks.length) { toast("没有勾选任何测试项", "bad"); return; }
+  const probeOn = !!S.settings.probeOn;
+  if (!qs.length && !tasks.length && !probeOn) { toast("没有勾选任何测试项", "bad"); return; }
   const judgeOn = S.settings.judgeOn && tasks.length > 0;
 
   S.timeline = [];
@@ -440,13 +587,13 @@ async function runAll() {
   S.running = true;
   $("#btnRun").disabled = true;
   $("#btnStop").disabled = false;
-  log("开始", `检测开始 · 端点 ${targets.length} · 学科题 ${qs.length} · SVG 题 ${tasks.length}`,
-    judgeOn ? "视觉裁判已启用" : (tasks.length ? "未启用裁判（仅生成）" : "仅学科题"), "run");
+  log("开始", `检测开始 · 端点 ${targets.length} · 学科题 ${qs.length} · SVG 题 ${tasks.length}${probeOn ? " · 指纹探针 " + PROBE_ITEMS.length + " 项" : ""}`,
+    [judgeOn ? "视觉裁判已启用" : (tasks.length ? "未启用裁判（仅生成）" : ""), probeOn ? "指纹鉴定已启用" : ""].filter(Boolean).join(" · ") || "仅学科题", "run");
 
   const cfg = cfgOf();
   const signal = S.abort.signal;
   const shouldStop = () => !S.running || signal.aborted;
-  let qTotal = 0, qCorrect = 0, svgCount = 0;
+  let qTotal = 0, qCorrect = 0, svgCount = 0, probeCount = 0;
 
   try {
     for (const p of targets) {
@@ -474,13 +621,15 @@ async function runAll() {
             done.n++;
             setProgress(`${model} · 学科题 ${done.n}/${qs.length}`);
             qTotal++; if (row.ok) qCorrect++;
+            entry.q.push(row);            // 实时进答题记录，运行中即可翻看
+            renderHist();
             log(row.ok ? "答对" : "答错",
               `${model} · ${q.id} ${q.type}`,
               `${row.ok ? "命中" : (row.got ? "答：" + String(row.got).slice(0, 60) : (row.error || "无答案"))} · ${row.latencyMs}ms`,
               row.ok ? "ok" : "bad");
             return row;
           }, shouldStop);
-          entry.q = rows.filter(Boolean).sort((a, b) => a.no - b.no);
+          entry.q.sort((a, b) => a.no - b.no);
           const ok = entry.q.filter((r) => r.ok).length;
           log("小结", `${model} · 学科题 ${ok}/${entry.q.length}`,
             `正确率 ${entry.q.length ? Math.round((ok / entry.q.length) * 100) : 0}%`,
@@ -530,6 +679,32 @@ async function runAll() {
             }
           }
           entry.svg.push(row);
+          renderHist();
+        }
+
+        // ---- 指纹探针 ----
+        if (probeOn && !shouldStop()) {
+          setPhase(`${model} · 指纹探针`);
+          log("指纹", `${model} · 开始 ${PROBE_ITEMS.length} 项探针`, `${PROBE_LAYERS.length} 层检测 · 数值指纹库 18 候选`, "info");
+          const fp = await opRunProbes(p, model, cfg, {
+            signal,
+            onProbe: (item, stage, row) => {
+              if (stage === "start") { setProgress(`${model} · ${item.title}`); setPhase(`${model} · ${item.title}`); }
+              else if (stage === "done" && row) {
+                log(row.level === "bad" ? "探针异常" : row.level === "warn" ? "探针可疑" : "探针通过",
+                  `${model} · ${row.title}`, String(row.evidence).slice(0, 120),
+                  row.level === "bad" ? "bad" : row.level === "warn" ? "warn" : row.level === "ok" ? "ok" : "info");
+              }
+            },
+          });
+          if (!shouldStop()) {
+            entry.probes = fp;
+            probeCount++;
+            renderHist();
+            log("指纹结论", `${model} · 真实性 ${fp.score} 分（${fp.verdict}）`,
+              fp.layers.map((l) => `${(PROBE_LAYERS.find((x) => x.key === l.key) || {}).title || l.key}:${l.verdict}`).join(" · "),
+              fp.score >= 85 ? "ok" : fp.score >= 60 ? "warn" : "bad");
+          }
         }
         markDone(p.id);
       }
@@ -552,7 +727,7 @@ async function runAll() {
   run.durationMs = Date.now() - run.ts;
   run.interrupted = !!interrupted;
   run.judgeOn = judgeOn;
-  run.qCount = qTotal; run.qCorrect = qCorrect; run.svgCount = svgCount;
+  run.qCount = qTotal; run.qCorrect = qCorrect; run.svgCount = svgCount; run.probeCount = probeCount;
   S.runs.unshift(run);
   if (S.runs.length > 60) S.runs.length = 60;
   await storeSave("runs", S.runs);
@@ -574,6 +749,86 @@ function stopRun() {
   S.running = false;
   try { S.abort.abort(); } catch { /* noop */ }
   setStatus("正在停止…");
+}
+
+// ==================== 指纹鉴定 ====================
+const LEVEL_MARK = { ok: ["✓", "var(--accent)"], info: ["•", "var(--muted)"], warn: ["!", "var(--warn)"], bad: ["✕", "var(--danger)"] };
+
+function renderForensics() {
+  const el = $("#view-forensics");
+  if (!el) return;
+  const run = currentRun();
+  const models = ((run && run.models) || []).filter((m) => m.probes);
+  if (!models.length) {
+    el.innerHTML = `<div class="empty">
+      还没有指纹鉴定结果<br>
+      <span class="sub">在左侧勾选「运行指纹探针」，点「开始检测」后会跑 ${PROBE_ITEMS.length} 项探针（${PROBE_LAYERS.length} 层）</span>
+      <div style="margin-top:12px"><span class="sub">数值指纹库：18 个候选模型 / 2 个家族（ModelTrace, MIT）</span></div>
+    </div>`;
+    return;
+  }
+  el.innerHTML = models.map((m, mi) => {
+    const fp = m.probes;
+    const layers = PROBE_LAYERS.map((L) => {
+      const sum = fp.layers.find((x) => x.key === L.key) || {};
+      const items = (fp.items || []).filter((x) => x.layer === L.key);
+      const cls = sum.verdict === "通过" ? "ok" : sum.verdict === "可疑" ? "warn" : "bad";
+      return `<section class="fp-layer">
+        <header class="fp-layer-head">
+          <span class="fp-ico">${L.icon}</span>
+          <div class="fp-layer-title"><b>${L.no}. ${esc(L.title)}</b><span class="sub">${esc(L.en)}</span></div>
+          <span class="pill ${cls}">${esc(sum.verdict || "未测")}</span>
+          <span class="sub">${sum.bad || 0} 异常 · ${sum.warn || 0} 可疑 · ${sum.ok || 0} 通过</span>
+        </header>
+        <div class="fp-why">
+          <div><b>检测原理</b>${L.principle.map((x) => `<div class="fp-li">· ${esc(x)}</div>`).join("")}</div>
+          <div><b>检测目的</b><div class="fp-li">${esc(L.purpose)}</div></div>
+        </div>
+        <div class="fp-items">
+          ${items.map((it) => {
+            const mk2 = LEVEL_MARK[it.level] || LEVEL_MARK.info;
+            return `<div class="fp-item">
+              <span class="fp-mark" style="color:${mk2[1]}">${mk2[0]}</span>
+              <div class="fp-item-body">
+                <div class="fp-item-title">${esc(it.title)}<span class="sub">${esc(it.note || "")}</span></div>
+                <div class="fp-item-ev">${esc(it.evidence)}</div>
+              </div>
+            </div>`;
+          }).join("")}
+        </div>
+      </section>`;
+    }).join("");
+    return `<div class="fp-card" data-mi="${mi}">
+      <header class="fp-card-head">
+        <div>
+          <div class="card-name">${esc(m.model)}</div>
+          <div class="sub">${esc(m.provider)} · ${PROBE_ITEMS.length} 项探针 · ${((fp.durationMs || 0) / 1000).toFixed(1)}s</div>
+        </div>
+        <span class="pill ${fp.score >= 85 ? "ok" : fp.score >= 60 ? "warn" : "bad"}">真实性 ${fp.score} 分 · ${esc(fp.verdict)}</span>
+        <button class="btn tiny" data-refp="${mi}">重跑指纹</button>
+      </header>
+      ${layers}
+    </div>`;
+  }).join("");
+  el.querySelectorAll("[data-refp]").forEach((b) => b.addEventListener("click", async () => {
+    const m = models[Number(b.dataset.refp)];
+    const pp = S.providers.find((x) => x.name === m.provider) || S.providers[0];
+    if (!pp) { toast("端点已不存在", "bad"); return; }
+    b.disabled = true;
+    b.textContent = "鉴定中…";
+    log("指纹", `${m.model} · 重跑 ${PROBE_ITEMS.length} 项探针`, `${PROBE_LAYERS.length} 层检测`, "info");
+    const fp2 = await opRunProbes(pp, m.model, cfgOf(), {
+      onProbe: (item, stage) => { if (stage === "start") setProgress(`${m.model} · ${item.title}`); },
+    });
+    m.probes = fp2;
+    await persistRuns();
+    setProgress("");
+    renderForensics();
+    renderHist();
+    log("指纹结论", `${m.model} · 真实性 ${fp2.score} 分（${fp2.verdict}）`,
+      fp2.layers.map((l) => `${l.key}:${l.verdict}`).join(" "), fp2.score >= 85 ? "ok" : fp2.score >= 60 ? "warn" : "bad");
+    toast(`${m.model} 指纹：${fp2.score} 分（${fp2.verdict}）`, fp2.score >= 85 ? "ok" : fp2.score >= 60 ? "warn" : "bad");
+  }));
 }
 
 // ==================== 成绩单 ====================
@@ -1148,12 +1403,14 @@ function renderTopStats() {
 }
 function renderAll() {
   renderTopStats();
+  renderHist();
   renderProviders();
   renderQList();
   renderJudgeSelect();
   renderResults();
   renderGallery();
   renderBank();
+  renderForensics();
   renderTimeline();
   renderGen();
 }
@@ -1194,6 +1451,11 @@ function bindStatic() {
   const sEl = $("#cfgSvgOn");
   sEl.checked = S.settings.svgOn;
   sEl.addEventListener("change", (e) => { S.settings.svgOn = e.target.checked; storeSave("settings", S.settings); renderBankCount(); });
+  const pEl = $("#cfgProbeOn");
+  if (pEl) {
+    pEl.checked = S.settings.probeOn;
+    pEl.addEventListener("change", (e) => { S.settings.probeOn = e.target.checked; storeSave("settings", S.settings); });
+  }
   $("#cfgJudgeModel").addEventListener("change", (e) => {
     S.settings.judgeModel = e.target.value;
     storeSave("settings", S.settings);
@@ -1208,15 +1470,25 @@ function bindStatic() {
       document.querySelectorAll("#tabs button").forEach((x) => x.classList.remove("active"));
       b.classList.add("active");
       S.tab = b.dataset.tab;
-      ["monitor", "results", "gallery", "bank"].forEach((t) => $("#view-" + t).classList.toggle("hidden", t !== S.tab));
+      ["monitor", "results", "gallery", "bank", "forensics"].forEach((t) => $("#view-" + t).classList.toggle("hidden", t !== S.tab));
       if (S.tab === "results") renderResults();
       if (S.tab === "gallery") renderGallery();
+      if (S.tab === "forensics") renderForensics();
       if (S.tab === "bank") renderBank();
     });
   });
 
+  document.querySelectorAll(".subtab").forEach((b) => {
+    b.addEventListener("click", () => setHistSub(b.dataset.sub));
+  });
   $("#modal").addEventListener("click", (e) => { if (e.target === $("#modal")) hideModal(); });
-  document.addEventListener("keydown", (e) => { if (e.key === "Escape") { hideModal(); closeMenu(); } });
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape") { hideModal(); closeMenu(); return; }
+    const tag = (e.target && e.target.tagName) || "";
+    if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT" || (e.target && e.target.isContentEditable)) return;
+    if (e.key === "ArrowLeft") { histStep(-1); e.preventDefault(); }
+    else if (e.key === "ArrowRight") { histStep(1); e.preventDefault(); }
+  });
   document.addEventListener("contextmenu", (e) => {
     const t = e.target;
     const tag = (t && t.tagName) || "";
@@ -1252,6 +1524,7 @@ function bindStatic() {
   applyTheme();
   bindStatic();
   renderAll();
+  setHistSub(S.hist.sub);
   setStatus("就绪");
 
   // e2e 测试钩子：?e2e=1[&base=...][&qs=Q1,Q12][&tasks=svg-ecg]
@@ -1290,5 +1563,7 @@ function bindStatic() {
 // 调试入口
 window.AH = {
   state: S, runAll, stopRun, exportCsv, shareModal, captureFrames, showGen,
+  histRows, renderHist, histStep, setHistSub,
   parseConn: parseConnText, renderAll, questions: QUESTIONS, tasks: SVG_TASKS,
+  histRows, renderHist, histStep, setHistSub, renderForensics, probes: PROBE_ITEMS, layers: PROBE_LAYERS,
 };

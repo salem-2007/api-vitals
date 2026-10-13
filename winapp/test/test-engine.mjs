@@ -1,5 +1,10 @@
 // test-engine.mjs — 引擎单元测试（不依赖浏览器，直接打真实 HTTP 到本地 mock）
 import http from "node:http";
+import { fileURLToPath } from "node:url";
+import { dirname, join } from "node:path";
+import { startMock } from "./mock-api.mjs";
+
+const here = dirname(fileURLToPath(import.meta.url));
 import {
   QUESTIONS, SVG_TASKS, GROUPS, TYPES, ADAPTERS,
   norm, numbers, gradeAnswer, extractAnswerLine, answerCandidates,
@@ -8,6 +13,7 @@ import {
   modelStats, groupStats, runStats, flattenRun, buildReportCsv, buildShareText,
   listModels, opAskQuestion, opGenSvg, opJudgeSvg, opJudgeAnswer, runPool,
   starsText, starsFromScore,
+  PROBE_LAYERS, PROBE_ITEMS, runProbe, opRunProbes, summarizeLayer, probeScore,
 } from "../wwwroot/engine.js";
 
 let pass = 0, fail = 0;
@@ -208,6 +214,134 @@ t("题目提示词含答案格式要求", /答案：/.test(buildQuestionPrompt(Q
 t("SVG 提示词禁止脚本", /禁止使用 <script>/.test(buildSvgPrompt(SVG_TASKS[0])));
 t("精细题用自带完整提示词", buildSvgPrompt(SVG_TASKS.find((s) => s.id === "svg-masterpiece")).includes("鹈鹕"));
 t("协议类型三种", TYPES.length === 3 && !!ADAPTERS.anthropic && !!ADAPTERS.gemini);
+
+
+// ---------------- 指纹探针 ----------------
+section("指纹探针：结构与调度");
+t("7 层 / 20 探针", PROBE_LAYERS.length === 7 && PROBE_ITEMS.length === 20,
+  `${PROBE_LAYERS.length}层 ${PROBE_ITEMS.length}探针`);
+t("每层 ≥1 个探针，且 ≥6 层有 ≥3 个", PROBE_LAYERS.every((l) => PROBE_ITEMS.filter((p) => p.layer === l.key).length >= 1)
+  && PROBE_LAYERS.filter((l) => PROBE_ITEMS.filter((p) => p.layer === l.key).length >= 3).length >= 6);
+t("层顺序与编号一致", PROBE_LAYERS.every((l, i) => l.no === i + 1), PROBE_LAYERS.map((l) => l.no + ":" + l.key).join(" "));
+t("探针 id 唯一", new Set(PROBE_ITEMS.map((p) => p.id)).size === PROBE_ITEMS.length);
+t("每层都有检测原理与目的", PROBE_LAYERS.every((l) => l.principle.length >= 2 && l.purpose));
+t("层级汇总：bad → 异常", summarizeLayer("infra", [
+  { layer: "infra", level: "ok" }, { layer: "infra", level: "bad" }]).verdict === "异常");
+t("层级汇总：warn → 可疑", summarizeLayer("infra", [
+  { layer: "infra", level: "ok" }, { layer: "infra", level: "warn" }]).verdict === "可疑");
+t("层级汇总：全 ok/info → 通过", summarizeLayer("infra", [
+  { layer: "infra", level: "ok" }, { layer: "infra", level: "info" }]).verdict === "通过");
+t("评分：满分 100", probeScore([{ bad: 0, warn: 0 }]).score === 100);
+t("评分：1 bad + 2 warn = 66", probeScore([{ bad: 1, warn: 2 }]).score === 66, probeScore([{ bad: 1, warn: 2 }]).score);
+t("评分：5 bad 触底 0", probeScore([{ bad: 5, warn: 0 }]).score === 0);
+
+const probeAnswers = Object.fromEntries(QUESTIONS.map((q) => [q.prompt, q.answer]));
+const probeMock = await startMock({ root: join(here, "..", "wwwroot"), answers: probeAnswers });
+const pbase = "http://127.0.0.1:" + probeMock.port + "/v1";
+const probeCfg = { timeoutMs: 8000, connectTimeoutMs: 5000, retries: 0, rlRetries: 0, rlBaseSec: 1, rlCapSec: 1 };
+
+section("指纹探针：干净官方模型（claude-opus-4-6）");
+{
+  const prov = { name: "官方直连", type: "openai", baseUrl: pbase, apiKey: "sk-t" };
+  const res = await opRunProbes(prov, "claude-opus-4-6", probeCfg, {});
+  t("跑满 20 项", res.items.length === 20, res.items.length);
+  t("无 bad", res.items.filter((r) => r.level === "bad").length === 0,
+    res.items.filter((r) => r.level === "bad").map((r) => r.id).join(","));
+  t("无 warn", res.items.filter((r) => r.level === "warn").length === 0,
+    res.items.filter((r) => r.level === "warn").map((r) => r.id + ":" + r.evidence.slice(0, 40)).join(" | "));
+  t("总评通过 / 满分", res.verdict === "通过" && res.score === 100, `${res.verdict} ${res.score}`);
+  t("6 层全部通过", res.layers.every((l) => l.verdict === "通过"));
+  const byId = Object.fromEntries(res.items.map((r) => [r.id, r]));
+  t("控制符注入未崩溃 → ok", byId["infra-control-token"].level === "ok");
+  t("tokenizer 确定性 → ok", byId["infra-tokenizer"].level === "ok", byId["infra-tokenizer"].evidence);
+  t("身份自述一致 → ok", byId["style-selfid"].level === "ok", byId["style-selfid"].evidence);
+  t("浮点陷阱答对", byId["logic-float"].level === "ok");
+  t("strawberry 计数答对", byId["logic-count"].level === "ok");
+  t("幻觉探针：承认不存在", byId["logic-hallucination"].level === "ok");
+  t("知识截断：自述与事实一致", byId["logic-cutoff"].level === "ok", byId["logic-cutoff"].evidence);
+  t("JSON 纯净", byId["agent-json"].level === "ok");
+  t("结构约束满足", byId["agent-schema"].level === "ok");
+  t("工具调用可用", byId["agent-tool"].level === "ok", byId["agent-tool"].evidence);
+  t("签名字段一致", byId["sign-response"].level === "ok", byId["sign-response"].evidence);
+  t("思维链痕迹存在", byId["sign-thinking"].level === "ok", byId["sign-thinking"].evidence);
+  t("协议一致", byId["sign-protocol"].level === "ok", byId["sign-protocol"].evidence);
+  t("数值指纹归因与请求模型一致", byId["numberfp-attribute"].level === "ok", byId["numberfp-attribute"].evidence);
+  t("归因给出模型与家族概率", /归因 Top3/.test(byId["numberfp-attribute"].evidence) && /家族：/.test(byId["numberfp-attribute"].evidence));
+}
+
+section("指纹探针：套壳降智模型（deepseek-r1）");
+{
+  const prov = { name: "可疑中转", type: "openai", baseUrl: pbase, apiKey: "sk-t" };
+  const res = await opRunProbes(prov, "deepseek-r1", probeCfg, {});
+  const byId = Object.fromEntries(res.items.map((r) => [r.id, r]));
+  const bads = res.items.filter((r) => r.level === "bad").map((r) => r.id);
+  t("总评异常", res.verdict === "异常", `${res.verdict} ${res.score}`);
+  t("基础设施指纹命中（x-ollama/uvicorn）", byId["infra-headers"].level === "bad", byId["infra-headers"].evidence);
+  t("控制符注入 400 → 高危套壳", byId["infra-control-token"].level === "bad", byId["infra-control-token"].evidence);
+  t("无 usage → 计费不可核验", byId["infra-tokenizer"].level === "warn", byId["infra-tokenizer"].evidence);
+  t("语言倒影泄露其它厂商", byId["style-reflection"].level === "warn", byId["style-reflection"].evidence);
+  t("身份自述与模型名不一致", byId["style-selfid"].level === "warn", byId["style-selfid"].evidence);
+  t("浮点陷阱答错", byId["logic-float"].level === "bad", byId["logic-float"].evidence);
+  t("strawberry 计数答错", byId["logic-count"].level === "bad");
+  t("幻觉：编造 DOI", byId["logic-hallucination"].level === "bad", byId["logic-hallucination"].evidence);
+  t("知识截断：自述与实际不符", byId["logic-cutoff"].level === "warn", byId["logic-cutoff"].evidence);
+  t("JSON 被 markdown 污染", byId["agent-json"].level === "bad", byId["agent-json"].evidence);
+  t("结构约束不符", byId["agent-schema"].level === "warn");
+  t("工具调用缺失", byId["agent-tool"].level === "warn");
+  t("响应 model 字段被改写", byId["sign-response"].level === "bad", byId["sign-response"].evidence);
+  t("usage 算术不符被抓", /算术不符/.test(byId["sign-response"].evidence), byId["sign-response"].evidence);
+  t("推理模型无思维链 → bad", byId["sign-thinking"].level === "bad", byId["sign-thinking"].evidence);
+  t("协议结构异常", ["bad", "warn"].includes(byId["sign-protocol"].level), byId["sign-protocol"].evidence);
+  t("至少 6 项 bad", bads.length >= 6, bads.join(","));
+  t("异常层数 ≥ 3", res.layers.filter((l) => l.verdict !== "通过").length >= 3,
+    res.layers.map((l) => l.key + ":" + l.verdict).join(" "));
+}
+
+section("指纹探针：单项直跑与边界");
+{
+  const prov = { name: "官方直连", type: "openai", baseUrl: pbase, apiKey: "sk-t" };
+  const item = PROBE_ITEMS.find((x) => x.id === "logic-float");
+  const r = await runProbe(prov, "claude-opus-4-6", item, probeCfg, {});
+  t("runProbe 单项可用", r.id === "logic-float" && r.level === "ok");
+  const na = await runProbe({ name: "g", type: "gemini", baseUrl: pbase, apiKey: "k" },
+    "gemini-2.0", PROBE_ITEMS.find((x) => x.id === "agent-tool"), probeCfg, {});
+  t("Gemini 工具探针标记不适用", na.level === "info" && /跳过/.test(na.evidence), na.evidence);
+  const stopped = await opRunProbes(prov, "claude-opus-4-5", probeCfg, { signal: { aborted: true } });
+  t("中断后不继续跑", stopped.items.length === 0);
+}
+
+section("指纹探针：换底模型（claude-sonnet-4-6 外壳 + GPT 数值指纹）");
+{
+  const prov = { name: "换底中转", type: "openai", baseUrl: pbase, apiKey: "sk-t" };
+  const res = await opRunProbes(prov, "claude-sonnet-4-6", probeCfg, {});
+  const fp = res.items.find((r) => r.id === "numberfp-attribute");
+  t("数值指纹判为异常", fp.level === "bad", fp.evidence);
+  t("归因家族为 GPT", /GPT/.test(fp.evidence) && /家族/.test(fp.evidence), fp.evidence);
+  t("证据含归因概率与校准信息", /β=/.test(fp.evidence) && /自评准确率/.test(fp.evidence), fp.evidence);
+  t("attribution 明细完整", fp.detail && fp.detail.attribution && fp.detail.attribution.top.length === 5,
+    JSON.stringify(fp.detail && fp.detail.attribution && fp.detail.attribution.top.slice(0, 2)));
+  t("3 次挑战均成功", fp.detail.calls.filter((c) => c.status === 200).length === 3, JSON.stringify(fp.detail.calls));
+}
+
+section("数值指纹：库匹配与边界");
+{
+  const { matchBankModel, summarizeNumberFp } = await import("../wwwroot/engine.js");
+  t("精确匹配", matchBankModel("gpt-5.5")?.id === "gpt-5.5");
+  t("带日期后缀匹配", matchBankModel("claude-sonnet-4-6-20250101")?.id === "claude-sonnet-4-6");
+  t("最长优先（不误配短 id）", matchBankModel("claude-opus-5-5")?.id === "claude-opus-5-5");
+  t("库外模型返回 null", matchBankModel("deepseek-r1") === null);
+  const fake = { results: [{ model: "gpt-5.4", display_name: "gpt-5.4", probability: 0.9 }],
+    family_probabilities: [{ family: "gpt", display_name: "GPT", probability: 0.95 }, { family: "claude", display_name: "Claude", probability: 0.05 }],
+    family_prediction: "gpt", family_prediction_name: "GPT", family_probability: 0.95,
+    prediction: "gpt-5.4", prediction_name: "gpt-5.4", probability: 0.9, used_outputs: 3,
+    calibration: { beta: 12, cv_accuracy: 1 } };
+  t("库外模型 → info", summarizeNumberFp(fake, "deepseek-r1").level === "info");
+  t("家族不符 → bad", summarizeNumberFp(fake, "claude-sonnet-4-6").level === "bad");
+  t("同家族版本不符 → warn", summarizeNumberFp(fake, "gpt-5.5").level === "warn");
+  t("命中 → ok", summarizeNumberFp(fake, "gpt-5.4").level === "ok");
+}
+
+probeMock.close();
 
 console.log(`\n结果：${pass} 通过 / ${fail} 失败`);
 process.exit(fail ? 1 : 0);
